@@ -1,0 +1,108 @@
+{
+  "name": "kestrel2-coder-4b",
+  "architectures": ["Kestrel2ForCausalLM"],
+  "revision": "day2-spec-0.1",
+  "parent": "kestrel-coder-4b (day1)",
+
+  "vocab_size": 131072,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "head_dim": 128,
+
+  "depth": {
+    "template": "prelude-recur-coda",
+    "prelude_layers": 2,
+    "recurrent_layers": 16,
+    "coda_layers": 2,
+    "unique_layers": 20,
+    "recurrent_steps_train": [1, 2, 3],
+    "recurrent_steps_default": 3,
+    "recurrent_steps_max": 8,
+    "kv_policy": "fixed-memory",
+    "kv_policy_note": "recurrent block caches K/V once, from the prelude output; later iterations refine queries only, so cache shape is independent of step count"
+  },
+
+  "attention": {
+    "type": "mla",
+    "kv_lora_rank": 512,
+    "q_lora_rank": 512,
+    "qk_rope_head_dim": 64,
+    "qk_nope_head_dim": 128,
+    "attention_sinks": 4,
+    "qk_norm": true,
+    "sparsity": {
+      "mode": "window+compressed+selected",
+      "window": 2048,
+      "compression_stride": 64,
+      "selection_block": 64,
+      "selection_topk": 12,
+      "anchor_budget": 256,
+      "anchor_source": "deterministic: def/class/import/signature lines + file outlines",
+      "anchor_learned": false
+    },
+    "indexer": {
+      "dim": 128,
+      "type": "hierarchical",
+      "coarse": "pooled block projection, stride 64",
+      "fine": "token-level rescoring inside the top-32 coarse blocks",
+      "precision": "fp8"
+    }
+  },
+
+  "ffn": {
+    "type": "swiglu",
+    "intermediate_size": 12288,
+    "activation": "silu",
+    "gate": true
+  },
+
+  "norm": {
+    "type": "rmsnorm",
+    "eps": 1e-6,
+    "qk_norm": true
+  },
+
+  "position": {
+    "type": "rope",
+    "rope_theta": 500000.0,
+    "rope_scaling": null,
+    "partial_rotary_factor": 1.0
+  },
+
+  "embeddings": {
+    "tie_word_embeddings": true,
+    "scale_embeddings_by_sqrt_d": false
+  },
+
+  "mtp": {
+    "num_heads": 2,
+    "drop_at_inference": true
+  },
+
+  "context": {
+    "native": 262144,
+    "extended": 1048576,
+    "staged_training": [4096, 16384, 65536, 262144]
+  },
+
+  "optimizer": {
+    "pretrain": "muon",
+    "post_train": "adamw",
+    "note": "Muon for the base run; AdamW from SFT onward, because the Muon advantage reverses after large pretraining budgets (arXiv 2611.03633)"
+  },
+
+  "init": {
+    "residual_output_proj_zero": true,
+    "loop_index_embedding": true
+  },
+
+  "precision": {
+    "train": "bf16-mixed",
+    "kv_cache": "fp8"
+  },
+
+  "training_tokens": 1200000000000,
+  "parameter_count_inference": 4125828176,
+  "parameter_count_training": 4159390800,
+  "parameter_count_note": "derived by tools/count_params_v2.py, asserted by kestrel2/model.py"
+}

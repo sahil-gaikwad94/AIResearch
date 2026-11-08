@@ -1,0 +1,51 @@
+{
+  "name": "kestrel3-coder",
+  "thesis": "capacity is cheap, validity is expensive",
+  "parameter_count_total": 20485187584,
+  "parameter_count_active": 1761814528,
+  "core": {
+    "d_model": 4096,
+    "layers": 16,
+    "attention": {
+      "type": "mla",
+      "d_c": 512,
+      "d_rope": 64,
+      "heads": 32,
+      "head_dim": 128,
+      "window": 4096,
+      "sinks_per_head": 1,
+      "kv_bytes_per_token_per_layer": 576
+    },
+    "memory": {
+      "type": "delta_rule_fast_weights",
+      "d_m": 512,
+      "rank": 256,
+      "read_before_write": true,
+      "state_bytes_per_session_fp16": 4194304,
+      "eta": 0.05
+    },
+    "moe": {
+      "experts_per_layer": 96,
+      "active_experts": 3,
+      "expert_d_ff": 1024,
+      "shared_expert": false,
+      "routing": "dropless_top_k",
+      "balancing": "auxiliary_loss_free_bias",
+      "activation_ratio": "1:32"
+    }
+  },
+  "serving": {
+    "decode_window": 4096,
+    "weights_fp8_gb": 20.48,
+    "weights_4bit_gb": 10.24,
+    "resident_hot_experts": 24,
+    "context_independent_state": true
+  },
+  "training": {
+    "tokens": 1784000000000,
+    "gpu_hours": 31025,
+    "peak_mfu": 0.32,
+    "optimizer": "muon",
+    "mid_train": "pull_request_replay"
+  }
+}

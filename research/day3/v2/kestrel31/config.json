@@ -1,0 +1,96 @@
+{
+  "name": "Kestrel-3.1",
+  "day": "day3/v2",
+  "thesis": "verification is the scarce resource; every subsystem converts cheap checks into capability",
+  "parameter_count_total": 20865312258,
+  "parameter_count_active": 1990944258,
+  "active_ratio": 0.0954,
+  "expert_sparsity": "1:42 (256 routed, 6 active)",
+  "param_to_active_ratio": 10.5,
+  "trunk": {
+    "layers": 16,
+    "d": 4096,
+    "heads": 32,
+    "dh": 128,
+    "d_c": 512,
+    "d_rope": 64,
+    "window": 4096
+  },
+  "memory": {
+    "type": "delta-rule fast weights",
+    "d_m": 512,
+    "r_m": 256,
+    "state_floats_per_session": 2097152,
+    "state_bytes_per_session_fp16": 4194304,
+    "dense_kv_256k_fp8_bytes": 2359296000,
+    "compression_vs_kv": 562
+  },
+  "moe": {
+    "n_experts": 256,
+    "top_k": 6,
+    "d_lat": 384,
+    "d_ff": 4096,
+    "shared_experts": 1,
+    "d_shared": 1024,
+    "balance": "aux-loss-free bias",
+    "dropless": true,
+    "params_per_layer": 1224737024,
+    "latent_expert_saving_vs_full_width": 10.7
+  },
+  "workspace": {
+    "layers": 4,
+    "d_w": 1024,
+    "d_ff": 4096,
+    "params": 117978114,
+    "r_range": [1, 8],
+    "r_default": 2,
+    "topology": "cross-attention to trunk + windowed self-attention + SwiGLU",
+    "flops_per_pass_gflop": 0.236,
+    "flops_per_cot_step_gflop": 2.908,
+    "cheaper_per_step": 12.3,
+    "depth_controller": "fixed-prior curriculum in training, verifier-conditioned ladder at inference"
+  },
+  "compute_gflop_per_token_forward": {
+    "window_4096": {"r1": 4.65, "r2": 4.79, "r4": 5.06, "r8": 5.59},
+    "note": "flat in context length; dense-attention counterfactual at 64k would be 28.4 GFLOP"
+  },
+  "training": {
+    "stages_gpu_hours": {
+      "pretrain_4k_1200B": 17418,
+      "window_extend_8k_150B": 2601,
+      "long_context_64k_60B": 871,
+      "pr_midtrain_32k_60B": 871,
+      "sft_32k_3B": 45,
+      "distillation_30B": 1773,
+      "execution_rl": 84,
+      "self_improvement_4_rounds": 17,
+      "ablations": 2000
+    },
+    "subtotal_gpu_hours": 25680,
+    "restarts_12pct": 3082,
+    "total_gpu_hours": 28761,
+    "cpu_core_hours_execution": 12000,
+    "cost_usd": {"1.5": 43000, "2.2": 63000, "3.0": 86000},
+    "wall_clock_days_128_gpus": 9.4
+  },
+  "serving": {
+    "weights_4bit_gb": 11.5,
+    "fits_24gb_card": true,
+    "always_on_weights_gb": 0.551,
+    "bytes_per_token_batch1_gb": 0.57,
+    "experts_touched_batch1": 5.9,
+    "experts_touched_batch16": 80.2,
+    "tok_per_s_bandwidth_ceiling_batch1": 5918
+  },
+  "verification_arithmetic": {
+    "note": "computed in tools/sim_verify.py from stated assumptions; not a measurement",
+    "p_solve_r1": 0.30,
+    "p_solve_r8": 0.615,
+    "ladder_solved": 0.963,
+    "ladder_cost_fraction_of_always_r8": 0.80,
+    "blind_judge_best_of_16": 0.280,
+    "commit_first_best_of_16": 0.985,
+    "poison_rate_at_p04_blind": 0.519,
+    "poison_rate_at_p04_commit_first": 0.018
+  }
+}

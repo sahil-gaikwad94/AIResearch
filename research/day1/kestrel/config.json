@@ -1,0 +1,77 @@
+{
+  "name": "kestrel-coder-4b",
+  "architectures": ["KestrelForCausalLM"],
+  "revision": "day1-spec-0.3",
+
+  "vocab_size": 131072,
+  "hidden_size": 3072,
+  "num_hidden_layers": 40,
+  "num_attention_heads": 24,
+  "head_dim": 128,
+
+  "attention": {
+    "type": "mla",
+    "kv_lora_rank": 448,
+    "q_lora_rank": 448,
+    "qk_rope_head_dim": 64,
+    "qk_nope_head_dim": 128,
+    "attention_sinks": 4,
+    "qk_norm": true,
+    "softcap": null
+  },
+
+  "ffn": {
+    "type": "swiglu",
+    "intermediate_size": 7680,
+    "activation": "silu",
+    "gate": true
+  },
+
+  "norm": {
+    "type": "rmsnorm",
+    "eps": 1e-6,
+    "zero_centered_gamma": false
+  },
+
+  "position": {
+    "type": "rope",
+    "rope_theta": 500000.0,
+    "rope_scaling": null,
+    "partial_rotary_factor": 1.0,
+    "no_pe_layers": []
+  },
+
+  "embeddings": {
+    "tie_word_embeddings": true,
+    "scale_embeddings_by_sqrt_d": false,
+    "embedding_dropout": 0.0
+  },
+
+  "mtp": {
+    "num_heads": 2,
+    "share_embeddings": true,
+    "drop_at_inference": true
+  },
+
+  "context": {
+    "native": 65536,
+    "extended": 262144,
+    "staged_training": [4096, 16384, 65536]
+  },
+
+  "init": {
+    "std": 0.02,
+    "residual_output_proj_zero": true,
+    "depth_scaled_init": true
+  },
+
+  "precision": {
+    "train": "bf16-mixed",
+    "optimizer_states": "fp32",
+    "kv_cache": "fp8"
+  },
+
+  "training_tokens": 1200000000000,
+  "parameter_count_inference": 4083400000,
+  "parameter_count_training": 4102300000
+}

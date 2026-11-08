@@ -45,3 +45,29 @@ From that: 256 latent-width experts at 1:42 sparsity (10.7× cheaper per expert 
 **20,865,312,258 parameters stored, 1,990,944,258 read per token, 28,761 GPU-hours, 11.5 GB at 4-bit.** Seven assertions in `kestrel31/model.py`, all passing.
 
 Start with [`day3/v2/01-thesis.md`](day3/v2/01-thesis.md), or the chapter everything depends on, [`day3/v2/08-verification.md`](day3/v2/08-verification.md).
+
+---
+
+## Day 4 — Kestrel-4 × VEXX 1.5
+
+[`day4/`](day4/) starts by auditing the three days before it. Seven defects are found — RoPE
+constructed but never applied, a decode path that bypassed the causal mask, expert bytes
+under-counted by 16×, a latent norm in every diagram and no module, a dead scorer, 256 experts
+that added no routed rank, and five soundness holes in the verifier — and every one of them
+pointed the same way: it made the design look better than it was.
+
+The answer is not a better promise, it is a different unit of verification. **Kestrel-4 moves
+the verifier inside the decode loop**: a four-tier stack (automaton → outward-rounded interval
+contractor → exact rational Fourier–Motzkin → CDCL jumpback) masks each token, splices
+deterministic fields without sampling, and rewinds to the clause that caused a conflict instead
+of to the start of the patch. The measured ladder is 0.719 → 0.012 → 0.00216 → **0.000324**
+false accepts, which turns self-training at a 40 % solve rate from a 1.8 % poison into a 0.049 %
+one, and turns a failed 600-token patch from 1,746 GFLOP into **52.4 GFLOP**.
+
+**21,248,719,490 parameters stored, 2,071,178,882 read per token (9.75 %), 25,067 GPU-hours,
+11.69 GB at 4-bit, 33,330 tok/s with splicing.** Eleven assertions in `kestrel4/model.py`, all
+passing; the config is generated from the reference implementation so the ledger cannot drift.
+
+Start with [`day4/01-what-day3-missed.md`](day4/01-what-day3-missed.md), which is an audit
+written after the fixes, or [`day4/04-verification.md`](day4/04-verification.md), which is the
+chapter the rest depends on.

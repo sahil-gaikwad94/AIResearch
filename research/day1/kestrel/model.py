@@ -167,6 +167,9 @@ class MLAttention(nn.Module):
 
         self.w_o = nn.Linear(self.n_heads * self.d_head, cfg.hidden_size, bias=False)
 
+        # latent norm BEFORE w_uk: keeps w_uk linearly absorbable at serving
+        # (the k_norm below stays, per-head, after the up-projection)
+        self.ckv_norm = RMSNorm(self.d_c, cfg.rms_norm_eps) if a.qk_norm else nn.Identity()
         self.q_norm = RMSNorm(self.d_head, cfg.rms_norm_eps) if a.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(self.d_head, cfg.rms_norm_eps) if a.qk_norm else nn.Identity()
 
@@ -192,7 +195,7 @@ class MLAttention(nn.Module):
             k_pe = torch.cat([cache["k_pe"], k_pe], dim=1)
             cache["c_kv"], cache["k_pe"] = c_kv_part, k_pe
 
-        k_nope = self.k_norm(self.w_uk(c_kv_part).view(b, -1, h, dh))
+        k_nope = self.k_norm(self.w_uk(self.ckv_norm(c_kv_part)).view(b, -1, h, dh))
         v = self.w_uv(c_kv_part).view(b, -1, h, dh)
         k = torch.cat([k_nope, k_pe.expand(-1, -1, h, -1)], dim=-1)   # (b,s,h,dh+dr)
         q = torch.cat([q_nope, q_pe], dim=-1)

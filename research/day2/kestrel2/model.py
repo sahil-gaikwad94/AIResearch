@@ -62,8 +62,8 @@ FULL = Cfg(
     sinks=4, max_r=8,
 )
 
-EXPECTED_INFERENCE = 4_125_828_176
-EXPECTED_TRAINING = 4_159_390_800
+EXPECTED_INFERENCE = 4_140_256_336
+EXPECTED_TRAINING = 4_173_818_960
 
 
 class RMSNorm(nn.Module):
@@ -94,8 +94,9 @@ class MLA(nn.Module):
         d, h, dh = c.d, c.heads, c.dh
         self.w_dq = nn.Linear(d, c.d_qc, bias=False)
         self.w_uq = nn.Linear(c.d_qc, h * dh, bias=False)
-        self.w_qr = nn.Linear(d, c.d_rope, bias=False)
+        self.w_qr = nn.Linear(c.d_qc, h * c.d_rope, bias=False)  # per-head rotary query from c_q
         self.w_dkv = nn.Linear(d, c.d_c + c.d_rope, bias=False)   # FUSED
+        self.ckv_norm = RMSNorm(c.d_c)                             # latent norm BEFORE w_uk
         self.w_uk = nn.Linear(c.d_c, h * dh, bias=False)
         self.w_uv = nn.Linear(c.d_c, h * dh, bias=False)
         self.w_o = nn.Linear(h * dh, d, bias=False)
@@ -104,7 +105,8 @@ class MLA(nn.Module):
         self.sink = nn.Parameter(torch.zeros(c.sinks))
         self.w_iq = nn.Linear(d, c.idx_dim, bias=False)
         self.w_ik = nn.Linear(c.d_c, c.idx_dim, bias=False)
-        self.w_ip = nn.Linear(c.d_c, c.idx_dim, bias=False)
+        # (no w_ip: the pooled block projector was dead weight — selection
+        # pooling is a plain mean over w_ik, not a second learned projection)
 
     def init_kv(self, x, offset: int = 0):
         """Project the cache ONCE; the recurrent block reuses it at every step."""
@@ -113,26 +115,33 @@ class MLA(nn.Module):
         return c_kv, rope(k_pe[:, :, None], pos, self.c.rope_theta)[:, :, 0]
 
     def build_mask(self, x, c_kv, anchors=None, dense=False):
+        """Sparse mask; works for decode too (n queries, m keys, m >= n).
+
+        The old code returned None when m != n, silently turning decode into a
+        dense pass over the whole cache — the exact cost the sparse design was
+        supposed to avoid.  Here query positions are offset by m - n so the
+        same window/selection rule applies at every sequence length.
+        """
         B, n, _ = x.shape
         m = c_kv.shape[1]
-        pos = torch.arange(n, device=x.device)
-        causal = pos[:, None] >= pos[None, :]
-        if m != n:            # decode: every cached key is visible
-            return None
+        offset = m - n
+        q_pos = torch.arange(offset, offset + n, device=x.device)
+        k_pos = torch.arange(m, device=x.device)
+        causal = q_pos[:, None] >= k_pos[None, :]
         if dense:             # exact causal reference path
             return causal[None, None]
         bs = self.c.sel_block
-        nb = (n + bs - 1) // bs
+        nb = (m + bs - 1) // bs
         ki = self.w_ik(c_kv)
-        if nb * bs > n:
-            ki = F.pad(ki, (0, 0, 0, nb * bs - n))
+        if nb * bs > m:
+            ki = F.pad(ki, (0, 0, 0, nb * bs - m))
         pooled = ki.view(B, nb, bs, -1).mean(2)
         scores = torch.einsum("bnd,bmd->bnm", self.w_iq(x), pooled)
         top = scores.topk(min(self.c.sel_topk, nb), dim=-1).indices
         sel = torch.zeros(B, n, nb, dtype=torch.bool, device=x.device)
         sel.scatter_(2, top, True)
-        sel = sel.repeat_interleave(bs, dim=2)[:, :, :n]
-        win = (pos[:, None] - pos[None, :]) < self.c.window
+        sel = sel.repeat_interleave(bs, dim=2)[:, :, :m]
+        win = (q_pos[:, None] - k_pos[None, :]) < self.c.window
         mm = win[None] | sel
         if anchors is not None:
             mm = mm.clone()
@@ -154,11 +163,12 @@ class MLA(nn.Module):
         m = c_kv.shape[1]
         pos = torch.arange(n, device=x.device) + (m - n)
 
-        q = self.q_norm(self.w_uq(self.w_dq(x)).view(B, n, c.heads, c.dh))
-        q_pe = rope(self.w_qr(x)[:, :, None], pos, c.rope_theta)
-        q = torch.cat([q, q_pe.expand(B, n, c.heads, c.d_rope)], dim=-1)
+        c_q = self.w_dq(x)
+        q = self.q_norm(self.w_uq(c_q).view(B, n, c.heads, c.dh))
+        q_pe = rope(self.w_qr(c_q).view(B, n, c.heads, c.d_rope), pos, c.rope_theta)
+        q = torch.cat([q, q_pe], dim=-1)
 
-        k_nope = self.k_norm(self.w_uk(c_kv).view(B, m, c.heads, c.dh))
+        k_nope = self.k_norm(self.w_uk(self.ckv_norm(c_kv)).view(B, m, c.heads, c.dh))
         v = self.w_uv(c_kv).view(B, m, c.heads, c.dh)
         k = torch.cat([k_nope, k_pe[:, :, None].expand(B, m, c.heads, c.d_rope)], -1)
 

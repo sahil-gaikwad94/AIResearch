@@ -23,14 +23,25 @@ FULL = dict(
     n_experts=96, top_k=3, d_ff=1024,
 )
 
-EXPECTED_TOTAL = 20_485_187_584
-EXPECTED_ACTIVE = 1_761_814_528
+EXPECTED_TOTAL = 20_497_778_688
+EXPECTED_ACTIVE = 1_774_405_632
 
 
 def _mask(n, w, device):
     i = torch.arange(n, device=device)[:, None]
     j = torch.arange(n, device=device)[None, :]
     return (j <= i) & (i - j < w)
+
+
+def _apply_rope(x, pos, theta=500000.0):
+    """x: [B, n, H, d_rope]; pos: [n] absolute positions."""
+    d = x.shape[-1]
+    inv = theta ** (-torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d)
+    freqs = pos.float()[:, None] * inv[None, :]
+    cos = freqs.cos()[None, :, None, :].to(x.dtype)
+    sin = freqs.sin()[None, :, None, :].to(x.dtype)
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
 
 
 class MLA(nn.Module):
@@ -42,8 +53,9 @@ class MLA(nn.Module):
         self.h, self.dh, self.dr, self.d_c = h, dh, dr, dc
         self.w_dq = nn.Linear(d, dc, bias=False)
         self.w_uq = nn.Linear(dc, h * dh, bias=False)
-        self.w_qr = nn.Linear(d, dr, bias=False)
+        self.w_qr = nn.Linear(dc, h * dr, bias=False)       # per-head rotary query from c_q
         self.w_dkv = nn.Linear(d, dc + dr, bias=False)
+        self.ckv_norm = nn.Parameter(torch.ones(dc))        # latent norm BEFORE w_uk
         self.w_uk = nn.Linear(dc, h * dh, bias=False)
         self.w_uv = nn.Linear(dc, h * dh, bias=False)
         self.w_o = nn.Linear(h * dh, d, bias=False)
@@ -54,15 +66,17 @@ class MLA(nn.Module):
     def forward(self, x):
         b, n, _ = x.shape
         h, dh, dr = self.h, self.dh, self.dr
+        pos = torch.arange(n, device=x.device)
         cq = self.w_dq(x)
         # norm the content dim only, before the RoPE channel is appended
         q = F.rms_norm(self.w_uq(cq).view(b, n, h, dh), (dh,), self.q_norm)
-        qr = self.w_qr(x).view(b, n, 1, dr)
-        q = torch.cat([q, qr.expand(b, n, h, dr)], dim=-1)
+        qr = _apply_rope(self.w_qr(cq).view(b, n, h, dr), pos)
+        q = torch.cat([q, qr], dim=-1)
         kv = self.w_dkv(x)
         ckv, kr = kv[..., : self.d_c], kv[..., -dr:]
+        ckv = F.rms_norm(ckv, (self.d_c,), self.ckv_norm)
         k = F.rms_norm(self.w_uk(ckv).view(b, n, h, dh), (dh,), self.k_norm)
-        k = torch.cat([k, kr.view(b, n, 1, dr).expand(b, n, h, dr)], dim=-1)
+        k = torch.cat([k, _apply_rope(kr.view(b, n, 1, dr), pos).expand(b, n, h, dr)], dim=-1)
         v = self.w_uv(ckv).view(b, n, h, dh)
         q, k = q.transpose(1, 2), k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -195,7 +209,7 @@ class Kestrel3(nn.Module):
 def active_params(c):
     """Weights actually read per token."""
     d, dc, dr, h, dh = c["d"], c["d_c"], c["d_rope"], c["heads"], c["dh"]
-    attn = (d * dc) + (dc * h * dh) + (d * dr) + (d * (dc + dr)) + (dc * h * dh) * 2 + (h * dh * d) + 2 * dh + h
+    attn = (d * dc) + (dc * h * dh) + (dc * h * dr) + (d * (dc + dr)) + (dc * h * dh) * 2 + (h * dh * d) + dc + 2 * dh + h
     mem = 5 * d * c["d_m"] + c["d_m"] * c["r_m"]
     moe = c["top_k"] * 3 * d * c["d_ff"] + d * c["n_experts"] + c["n_experts"]
     norm = 3 * d
@@ -205,9 +219,9 @@ def active_params(c):
 def total_params(c):
     d = c["d"]
     per_layer = (
-        (d * c["d_c"]) + (c["d_c"] * c["heads"] * c["dh"]) + (d * c["d_rope"])
+        (d * c["d_c"]) + (c["d_c"] * c["heads"] * c["dh"]) + (c["d_c"] * c["heads"] * c["d_rope"])
         + (d * (c["d_c"] + c["d_rope"])) + (c["d_c"] * c["heads"] * c["dh"]) * 2
-        + (c["heads"] * c["dh"] * d) + 2 * c["dh"] + c["heads"]
+        + (c["heads"] * c["dh"] * d) + c["d_c"] + 2 * c["dh"] + c["heads"]
         + 5 * d * c["d_m"] + c["d_m"] * c["r_m"]
         + c["n_experts"] * 3 * d * c["d_ff"] + d * c["n_experts"] + c["n_experts"]
         + 3 * d

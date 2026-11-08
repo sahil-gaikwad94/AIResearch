@@ -8,13 +8,13 @@ V = dict(vocab=131072, d=4096, heads=32, dh=128, d_c=512, d_rope=64,
 
 PEAK = 989e12
 MFU = 0.32          # MoE all-to-all and padding cost real time
-TOTAL = 20_485_187_584
-ACTIVE = 1_761_814_528
+TOTAL = 20_497_778_688
+ACTIVE = 1_774_405_632
 
 
 def attn_params():
     d, dc, dr, h, dh = V["d"], V["d_c"], V["d_rope"], V["heads"], V["dh"]
-    return (d*dc) + (dc*h*dh) + (d*dr) + (d*(dc+dr)) + 2*(dc*h*dh) + (h*dh*d) + 2*dh + h
+    return (d*dc) + (dc*h*dh) + (dc*h*dr) + (d*(dc+dr)) + 2*(dc*h*dh) + (h*dh*d) + dc + 2*dh + h
 
 
 def mem_params():
@@ -105,8 +105,16 @@ def main():
     state = state_floats * 1
     for batch in (1, 16):
         distinct = V["n_experts"] * (1 - (1 - V["top_k"]/V["n_experts"])**batch)
-        ebytes = distinct * 3 * V["d"] * V["d_ff"]
-        total = ACTIVE * 1 + kv + state + ebytes
+        # ACTIVE already contains the top_k active experts per layer for a
+        # single token, so counting distinct experts on top double-counts
+        # them.  Corrected: strip the baked-in active experts out of ACTIVE,
+        # then stream every distinct expert slot touched on EVERY layer
+        # (the per-layer expert set is independent, so routed bytes carry a
+        # factor of L).
+        per_expert = 3 * V["d"] * V["d_ff"]
+        base = ACTIVE - V["layers"] * V["top_k"] * per_expert
+        ebytes = V["layers"] * distinct * per_expert
+        total = base * 1 + kv + state + ebytes
         print(f"  batch {batch:>2}: experts touched {distinct:5.1f}  "
               f"bytes {total/1e9:5.2f} GB  -> {total/3.35e12*1e3:5.2f} ms/step  "
               f"{batch/(total/3.35e12):8,.0f} tok/s")

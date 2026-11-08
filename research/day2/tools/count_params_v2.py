@@ -43,20 +43,21 @@ def layer_params(d, d_c, d_qc, d_rope, n_h, dh, d_ff, indexer=False):
     p = {}
     p["W_DQ"]  = d * d_qc
     p["W_UQ"]  = d_qc * n_h * dh
-    p["W_QR"]  = d * d_rope              # decoupled rope key, applied pre-cache
+    p["W_QR"]  = d_qc * n_h * d_rope     # per-head rotary query from c_q
     p["W_DKV"] = d * (d_c + d_rope)      # FUSED: emits c_kv || k_pe in one matmul
     p["W_UK"]  = d_c * n_h * dh
     p["W_UV"]  = d_c * n_h * dh
     p["W_O"]   = d * n_h * dh
     p["qk_norm"] = 2 * dh          # per-head RMSNorm on q and k
+    p["ckv_norm"] = d_c            # latent norm BEFORE w_uk (keeps w_uk absorbable)
     p["sinks"] = V.get("sinks", 4)  # learned attention sinks, per head
     p["norms"] = 2 * d
     p["ffn"]   = 3 * d * d_ff            # gate, up, down
     if indexer:
-        # hierarchical indexer: coarse block projection + fine query/key
+        # hierarchical indexer: query + block-key projector (pooled by mean,
+        # no separate learned projector -- the old W_IP was dead weight)
         p["W_IQ"] = d * V["idx_dim"]
         p["W_IK"] = d_c * V["idx_dim"]
-        p["W_IP"] = d_c * V["idx_dim"]   # coarse pooled-block projector
     return p
 
 def count():
@@ -71,7 +72,7 @@ def count():
     loop_emb = V.get("max_r", 8) * d       # per-iteration index embedding
     mtp = V["mtp"] * (d * d + d)          # RMSNorm weight (d) + Linear(d,d) each
     return dict(per_layer=per_layer, attn_only=sum(v for k, v in sparse.items()
-                if not k.startswith(("ffn", "norms", "W_IQ", "W_IK", "W_IP"))),
+                if not k.startswith(("ffn", "norms", "W_IQ", "W_IK"))),
                 ffn=sparse["ffn"], body=body, embed=embed, mtp=mtp,
                 inference=body + final_norm + loop_emb + embed,
                 training=body + final_norm + loop_emb + embed + mtp,

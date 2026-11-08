@@ -17,8 +17,8 @@ MFU = 0.32
 BW = 3.35e12            # HBM bytes/s, H100-class
 TOTAL = total_params(V)
 ACTIVE = active_params(V)
-EXPECTED_TOTAL = 20_865_312_258
-EXPECTED_ACTIVE = 1_990_944_258
+EXPECTED_TOTAL = 21_215_543_938
+EXPECTED_ACTIVE = 2_038_003_330
 
 L, D, W = V["layers"], V["d"], V["window"]
 WS = workspace_params(V)
@@ -146,7 +146,11 @@ def main():
     for b in (1, 16, 64):
         draw = b * V["top_k"]
         distinct = V["n_experts"] * (1 - (1 - 1 / V["n_experts"]) ** draw)
-        step_bytes = always * 0.55 + distinct * exp_bytes
+        # routing is per-layer and independent across layers, so the step
+        # streams the distinct expert slots touched on EVERY layer: the expert
+        # bytes carry a factor of L (an earlier draft left it out -- a 16x
+        # under-count of the routed bytes).
+        step_bytes = always * 0.55 + L * distinct * exp_bytes
         per_tok = step_bytes / b
         tps = b / (step_bytes / BW)
         print(f"  {b:5d}  {per_tok / 1e9:9.2f} GB  {distinct:7.1f}  {tps:10,.0f}")

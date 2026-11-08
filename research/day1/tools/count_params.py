@@ -41,8 +41,9 @@ def attn_params():
     w_o = (H * DH) * D                  # output
     w_qr = D * (H * D_ROPE)             # q rope channels, direct from x
     qk_norm = 2 * DH                    # per-head RMSNorm on q and k
+    ckv_norm = D_C                      # latent norm BEFORE w_uk (absorbable)
     return dict(w_dq=w_dq, w_uq=w_uq, w_dkv=w_dkv, w_uk=w_uk, w_uv=w_uv,
-                w_o=w_o, w_qr=w_qr, qk_norm=qk_norm)
+                w_o=w_o, w_qr=w_qr, qk_norm=qk_norm, ckv_norm=ckv_norm)
 
 
 def ffn_params():

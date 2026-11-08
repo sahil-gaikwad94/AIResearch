@@ -1,0 +1,399 @@
+diff --git a/crates/vexx-core/src/json.rs b/crates/vexx-core/src/json.rs
+index 0d5b290..46f1c53 100644
+--- a/crates/vexx-core/src/json.rs
++++ b/crates/vexx-core/src/json.rs
+@@ -404,7 +404,13 @@ impl VocabularyTrie {
+ 
+     fn append_eos(&self, base: &crate::pda::Pda, eos: Option<&str>, allowed: &mut Vec<u32>) {
+         let Some(eos) = eos else { return };
+-        if !base.is_complete() {
++        // EOS is legal exactly when the document can CANNOT grow further: the
++        // PDA accepts.  is_complete() (mode == Structure && need == Stop) is
++        // too strong — a top-level number like `1` ends in Mode::Number with
++        // no delimiter, and is_complete() would forbid EOS there, forcing a
++        // spurious trailing token.  accepts() closes the pending number via
++        // finish(), which is precisely the document EOS certifies.
++        if !base.accepts() {
+             return;
+         }
+         match self.eos_token {
+@@ -885,4 +891,16 @@ mod tests {
+         assert!(done.contains(&6));
+         assert_eq!(done, vec![6]);
+     }
++
++    #[test]
++    fn eos_is_legal_after_a_pending_top_level_number() {
++        // `1` ends inside the number token (no closing delimiter), so
++        // is_complete() is false but accepts() is true — EOS must still be
++        // allowed, otherwise a bare-number document can never terminate.
++        let vocabulary: Vec<String> = vec!["1".to_string(), "<stop>".to_string()];
++        let allowed = mask("1", &vocabulary, Some("<stop>"));
++        assert!(allowed.contains(&1), "EOS must be allowed after a pending number");
++        // ...but nothing may follow the number except EOS-adjacent structure.
++        assert!(!allowed.contains(&0) || allowed.contains(&1));
++    }
+ }
+diff --git a/crates/vexx-core/src/solver.rs b/crates/vexx-core/src/solver.rs
+index d9157c1..6c90c61 100644
+--- a/crates/vexx-core/src/solver.rs
++++ b/crates/vexx-core/src/solver.rs
+@@ -220,15 +220,45 @@ fn normalized_key(row: &Row) -> Vec<(u32, i128, i128)> {
+     key
+ }
+ 
++/// |pivot| used by [`normalized_key`]: the largest-|coefficient| magnitude,
++/// or 1 for constant rows (no coefficients to scale by).
++fn abs_pivot(row: &Row) -> Option<Rational> {
++    let mut abs_max: Option<Rational> = None;
++    for coeff in row.coeffs.values() {
++        let abs_c = if coeff.is_negative() { coeff.neg() } else { *coeff };
++        let larger = match &abs_max {
++            None => true,
++            Some(m) => abs_c.compare(*m) == Some(Ordering::Greater),
++        };
++        if larger {
++            abs_max = Some(abs_c);
++        }
++    }
++    Some(abs_max.unwrap_or(Rational::ONE))
++}
++
+ fn subsume(rows: Vec<Row>) -> Vec<Row> {
+     let mut buckets: BTreeMap<Vec<(u32, i128, i128)>, Row> = BTreeMap::new();
+     for row in rows {
+         let key = normalized_key(&row);
++        // Two rows share a key iff they are POSITIVE scalar multiples of each
++        // other (the key divides coefficients by |pivot|, preserving sense), so
++        // the tighter row is the one with the smaller SCALED bound
++        // bound/|pivot|.  Comparing raw bounds keeps the wrong row whenever
++        // the buckets' rows have different magnitudes: `2x+2y <= 8` vs
++        // `x+y <= 3` share the key (1,1) but the second is tighter (8/2=4 > 3).
++        // If either scaled bound overflows, keep both rows (sound: never
++        // drop a row we cannot prove redundant).
++        let scaled_row = abs_pivot(&row).and_then(|p| row.bound.div(p));
+         match buckets.get_mut(&key) {
+             Some(current) => {
+-                let tighter = match row.bound.compare(current.bound) {
+-                    Some(Ordering::Less) => true,
+-                    Some(Ordering::Equal) => row.strict && !current.strict,
++                let scaled_current = abs_pivot(current).and_then(|p| current.bound.div(p));
++                let tighter = match (scaled_row, scaled_current) {
++                    (Some(sr), Some(sc)) => match sr.compare(sc) {
++                        Some(Ordering::Less) => true,
++                        Some(Ordering::Equal) => row.strict && !current.strict,
++                        _ => false,
++                    },
+                     _ => false,
+                 };
+                 if tighter {
+@@ -658,4 +688,29 @@ mod tests {
+         let constraints = [atom(&[(0, 1.0)], 1.0, CmpOp::Ne)];
+         assert!(matches!(solve(&constraints), Outcome::Unknown { .. }));
+     }
++
++    #[test]
++    fn subsume_compares_scaled_bounds() {
++        // 2x + 2y <= 4 is 2x+2y normalised_key (1,1) with scaled bound 2, which
++        // is TIGHTER than x+y <= 3 (scaled bound 3).  Comparing raw bounds
++        // (4 vs 3) keeps the looser row and can flip UNSAT to a wrong SAT.
++        let tight = Row {
++            coeffs: BTreeMap::from([(0, Rational::new(2, 1).expect("2")), (1, Rational::new(2, 1).expect("2"))]),
++            bound: Rational::new(4, 1).expect("4"),
++            strict: false,
++            sources: 0,
++        };
++        let loose = Row {
++            coeffs: BTreeMap::from([(0, Rational::ONE), (1, Rational::ONE)]),
++            bound: Rational::new(3, 1).expect("3"),
++            strict: false,
++            sources: 0,
++        };
++        let kept = subsume(vec![tight.clone(), loose.clone()]);
++        assert_eq!(kept.len(), 1, "one bucket, one row");
++        assert_eq!(kept[0].bound, tight.bound, "the scaled-tighter row survives");
++        let kept = subsume(vec![loose, tight]);
++        assert_eq!(kept.len(), 1);
++        assert_eq!(kept[0].bound, Rational::new(4, 1).expect("4"));
++    }
+ }
+diff --git a/python/vexx/bridges/hf_transformers.py b/python/vexx/bridges/hf_transformers.py
+index 9d1d361..35c7760 100644
+--- a/python/vexx/bridges/hf_transformers.py
++++ b/python/vexx/bridges/hf_transformers.py
+@@ -14,6 +14,21 @@ from typing import Any
+ from ..json_pda import JSONSyntaxError, TokenMasker
+ 
+ 
++class InfeasibleContract(RuntimeError):
++    """The specification cannot be satisfied by any document, so no token can be legal.
++
++    Raised by :meth:`VexxLogitsProcessor.preflight` before the first token. Without this gate
++    an infeasible contract only fails at the end of a full generation, after every token has
++    been paid for, and the mask has no legal continuation at the first field it touches.
++    """
++
++    def __init__(self, report: Any):
++        self.report = report
++        details = getattr(report, "details", None) or []
++        summary = "; ".join(str(d) for d in details[:3])
++        super().__init__(f"specification is infeasible: {summary or 'exact solver returned UNSAT'}")
++
++
+ def _report_ok(report: Any) -> bool:
+     if report is None:
+         return True
+@@ -102,6 +117,40 @@ class VexxLogitsProcessor:
+ 
+         return verify_json(self.spec, text)
+ 
++    def preflight(self) -> Any:
++        """Tier-2 gate: run the exact rational preflight before decoding starts.
++
++        Returns the :class:`~vexx.compiler.vir.PreflightResult` for a decidable spec, ``None``
++        when no spec was supplied, and raises :class:`InfeasibleContract` when the exact solver
++        proves ``UNSAT``. ``UNKNOWN`` is *not* an error here: a spec the solver cannot decide is
++        still worth attempting, and the per-token tiers will reject whatever is provably bad.
++        """
++        if self.spec is None:
++            return None
++        from ..compiler.preflight import run_preflight
++
++        vir = getattr(self.spec, "spec", self.spec)
++        report = run_preflight(vir)
++        if getattr(report, "status", None) == "UNSAT":
++            raise InfeasibleContract(report)
++        return report
++
++    def tiers(self) -> dict[str, str]:
++        """What this processor actually wires, so "four-tier" is inspectable rather than claimed.
++
++        ``mask`` is tier 0 and always exact when a vocabulary is available. ``contract`` and
++        ``solver`` are available whenever a spec is attached (tier 1 interval contraction and
++        tier 2 exact feasibility, reached through :meth:`preflight` and the schema mask's domain
++        checks). ``jumpback`` lives in the decode engine, not in a logits processor: a dead-end
++        row is recorded and the orchestrator rewinds, which a HF ``LogitsProcessor`` cannot do.
++        """
++        return {
++            "mask": "exact" if self.masker is not None else "unavailable",
++            "contract": "available" if self.spec is not None else "unavailable",
++            "solver": "available" if self.spec is not None else "unavailable",
++            "jumpback": "engine",
++        }
++
+     def _rows(self, scores: Any) -> list[Any]:
+         ndim = getattr(scores, "ndim", None)
+         if ndim is not None:
+@@ -167,4 +216,4 @@ class HFTransformersBridge:
+         return self.logits_processor.verify(text)
+ 
+ 
+-__all__ = ["HFTransformersBridge", "VexxLogitsProcessor", "JSONSyntaxError"]
++__all__ = ["HFTransformersBridge", "InfeasibleContract", "VexxLogitsProcessor", "JSONSyntaxError"]
+diff --git a/python/vexx/compiler/ast_transpiler.py b/python/vexx/compiler/ast_transpiler.py
+index 94f0daf..a79cc92 100644
+--- a/python/vexx/compiler/ast_transpiler.py
++++ b/python/vexx/compiler/ast_transpiler.py
+@@ -25,13 +25,19 @@ class TranspileError(ValueError):
+ 
+ def _extract_simple_bounds(expr: VirExpr) -> list[tuple[int, str, float, bool]]:
+     """Extract simple variable bounds from a require expression.
+-    
++
+     Returns list of (var_id, op, value, exclusive) for constraints like:
+     - var >= value (op='ge', exclusive=False)
+     - var > value (op='gt', exclusive=True)
+     - var <= value (op='le', exclusive=False)
+     - var < value (op='lt', exclusive=True)
+     - var == value (op='eq', exclusive=False)
++
++    Only bounds under a *conjunction* (``and``) are valid hard bounds.  The
++    extractor deliberately does NOT descend into ``or``/``not``/other nodes:
++    a bound inside a disjunction is not entailed by the whole — extracting
++    ``x >= 5`` from ``x >= 5 or y <= 0`` would over-constrain the model and
++    silently drop every assignment that satisfies the second disjunct.
+     """
+     bounds = []
+     
+@@ -42,6 +48,7 @@ def _extract_simple_bounds(expr: VirExpr) -> list[tuple[int, str, float, bool]]:
+         if kind == "and":
+             for arg in getattr(node, "args", []) or []:
+                 visit(arg)
++            return  # do not fall through to the generic recursion below
+         elif kind == "compare":
+             lhs = getattr(node, "lhs", None)
+             rhs = getattr(node, "rhs", None)
+@@ -58,16 +65,9 @@ def _extract_simple_bounds(expr: VirExpr) -> list[tuple[int, str, float, bool]]:
+                     # Flip the operator
+                     flipped = {"le": "ge", "lt": "gt", "ge": "le", "gt": "lt", "eq": "eq", "ne": "ne"}.get(op, op)
+                     bounds.append((rhs.var_id, flipped, bound, flipped in ("gt", "lt")))
+-        # Recurse into other expression types that might contain compares
+-        for child in (
+-            getattr(node, "lhs", None),
+-            getattr(node, "rhs", None),
+-            getattr(node, "predicate", None),
+-            getattr(node, "iterable", None),
+-        ):
+-            visit(child)
+-        for arg in getattr(node, "args", []) or []:
+-            visit(arg)
++        # Anything else (or, not, xor, arithmetic, ...) is a wall, not a path:
++        # a compare nested inside it is not a hard bound (see docstring).
++        return
+     
+     visit(expr)
+     return bounds
+diff --git a/python/vexx/compiler/vir.py b/python/vexx/compiler/vir.py
+index d71b122..93e4e1e 100644
+--- a/python/vexx/compiler/vir.py
++++ b/python/vexx/compiler/vir.py
+@@ -145,29 +145,52 @@ class ContainerInfo:
+         return lo, hi
+ 
+     def residual_feasible(self, current_sum: float, emitted: int) -> bool:
++        """Can the final sum still satisfy `sum_op target_sum`?
++
++        Operator-aware: an earlier version always assumed `eq` — for a `le`
++        target it demanded the suffix sum EQUAL the remaining distance, which
++        wrongly prunes any completion whose final sum comes in under target
++        (and symmetrically for `ge`).  This must stay *lenient*: returning
++        False prunes a branch, so it may only happen when no suffix can
++        satisfy the operator.  `_can_close` owns the strict final check.
++        """
+         if self.target_sum is None:
+             return True
+         lo_len, hi_len = self.cardinality_bounds()
+         remaining = self.target_sum - current_sum
+         m_min = max(0, lo_len - emitted)
++        # Reachable interval of suffix sums.
+         if hi_len is None:
+             if self.elem_min <= 0 <= self.elem_max:
+-                return True
++                return True  # any suffix sum is reachable; every op is satisfiable
+             if self.elem_min > 0:
+-                return remaining >= m_min * self.elem_min - self.sum_tol
+-            return remaining <= m_min * self.elem_max + self.sum_tol
+-        m_max = hi_len - emitted
+-        if m_max < m_min:
+-            return False
+-        # The union over integer suffix lengths is an interval here because consecutive
+-        # lengths have overlapping reachable sums when zero lies in the element domain;
+-        # otherwise all element signs agree and the extreme cardinalities are sufficient.
+-        low = min(m_min * self.elem_min, m_max * self.elem_min)
+-        high = max(m_min * self.elem_max, m_max * self.elem_max)
+-        if self.elem_min <= 0 <= self.elem_max:
+-            low = m_max * self.elem_min
+-            high = m_max * self.elem_max
+-        return low - self.sum_tol <= remaining <= high + self.sum_tol
++                low, high = m_min * self.elem_min, float("inf")
++            else:
++                low, high = float("-inf"), m_min * self.elem_max
++        else:
++            m_max = hi_len - emitted
++            if m_max < m_min:
++                return False
++            # The union over integer suffix lengths is an interval here because consecutive
++            # lengths have overlapping reachable sums when zero lies in the element domain;
++            # otherwise all element signs agree and the extreme cardinalities are sufficient.
++            low = min(m_min * self.elem_min, m_max * self.elem_min)
++            high = max(m_min * self.elem_max, m_max * self.elem_max)
++            if self.elem_min <= 0 <= self.elem_max:
++                low = m_max * self.elem_min
++                high = m_max * self.elem_max
++        tol = self.sum_tol
++        if self.sum_op == "eq":
++            return low - tol <= remaining <= high + tol
++        if self.sum_op in ("le", "lt"):
++            # Some suffix must come in at/below `remaining`: the smallest
++            # reachable suffix has to fit under it (strict treated leniently).
++            return low - tol <= remaining
++        if self.sum_op in ("ge", "gt"):
++            # Some suffix must reach up to `remaining`: the largest reachable
++            # suffix has to get there (strict treated leniently).
++            return remaining <= high + tol
++        return False
+ 
+     def residual_interval(self, current_sum: float, emitted: int):
+         if self.target_sum is None or self.sum_op != "eq":
+diff --git a/python/vexx/proof/certificate.py b/python/vexx/proof/certificate.py
+index 488abb1..1e97076 100644
+--- a/python/vexx/proof/certificate.py
++++ b/python/vexx/proof/certificate.py
+@@ -707,8 +707,11 @@ def verify_certificate(
+ 
+     Reconstructs the VIR spec from the payload and re-evaluates every constraint against
+     the witness.  ``expected_spec`` additionally binds the certificate to a live spec.
+-    ``verify_signature`` optionally provides an Ed25519 public key to verify the certificate's
+-    digital signature.
++    ``verify_signature`` provides an Ed25519 public key to verify the certificate's
++    digital signature.  A certificate that carries a signature MUST be verified
++    against a trusted key: without one, verification FAILS (an unverified
++    signature proves nothing, and silently accepting it would be a soundness
++    hole).  Unsigned certificates assert content integrity only.
+     """
+ 
+     checks: list[CertificateCheck] = []
+@@ -826,6 +829,17 @@ def verify_certificate(
+         except Exception as exc:
+             checks.append(CertificateCheck("expected_spec", False, str(exc)))
+ 
++    # A signed certificate without a trusted key must not verify: the
++    # signature would otherwise be dead weight that any reader assumes was
++    # checked.  Unsigned certificates skip this block entirely.
++    if verify_signature is None and certificate.metadata.get("signature"):
++        checks.append(CertificateCheck(
++            "signature", False,
++            "certificate is signed but no trusted Ed25519 public key was supplied; "
++            "refusing to accept unverified authenticity",
++        ))
++        errors.append("signed certificate presented without a trusted public key")
++
+     # Verify digital signature if public key provided
+     if verify_signature is not None:
+         if not _CRYPTO_AVAILABLE:
+diff --git a/tests/test_bridges.py b/tests/test_bridges.py
+index c5a6027..722537a 100644
+--- a/tests/test_bridges.py
++++ b/tests/test_bridges.py
+@@ -66,6 +66,41 @@ def test_hf_processor_masks_invalid_tokens_and_allows_eos():
+     assert processor.verify('{"a": 0.25, "b": 0.75}').status == "PASS"
+ 
+ 
++class Dual(BaseModel):
++    a: float
++    b: float
++
++
++@vt.verified_schema(preflight_check=False)  # decoration must not raise; the bridge gate does
++def impossible(p: Dual):
++    vt.require(p.a >= 0.8)
++    vt.require(p.b >= 0.8)
++    vt.require(p.a + p.b == 1.0)
++
++
++def test_preflight_rejects_an_infeasible_contract_before_any_token():
++    from vexx.bridges.hf_transformers import InfeasibleContract
++
++    processor = VexxLogitsProcessor(FakeTokenizer(), spec=impossible)
++    with pytest.raises(InfeasibleContract) as error:
++        processor.preflight()
++    assert error.value.report.status == "UNSAT"
++
++    feasible = VexxLogitsProcessor(FakeTokenizer(), spec=linear)
++    report = feasible.preflight()
++    assert report.status in {"SAT", "UNKNOWN"}
++    assert feasible.tiers() == {
++        "mask": "exact",
++        "contract": "available",
++        "solver": "available",
++        "jumpback": "engine",
++    }
++    grammar_only = VexxLogitsProcessor(FakeTokenizer())
++    assert grammar_only.preflight() is None
++    assert grammar_only.tiers()["mask"] == "exact"
++    assert grammar_only.tiers()["contract"] == "unavailable"
++
++
+ def test_host_adapters_attach_processors():
+     tokenizer = FakeTokenizer()
+     engine = SimpleNamespace(logits_processor=[])

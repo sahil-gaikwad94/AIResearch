@@ -74,10 +74,18 @@ The global layer drops RoPE entirely and selects keys instead of attending to al
 keys per query = window (4,096) + top-8 blocks × 64 + 256 anchors = 4,864, at any context
 ```
 
-Selection is a two-stage indexer over `d_idx = 128`: coarse block scores (`w_iq` × pooled
-`w_ip`), then fine token scores (`w_ik`). Assertion [4] checks that all three matrices receive
-gradient — the day 3.1 indexer had a scorer that was instantiated and never used, and a
-gradient check is the cheapest way to make that class of bug fail loudly.
+Selection is a two-projection indexer over `d_idx = 128`: `w_iq` scores the token against a
+block summary built from the pooled latent (`w_ip`) and from a per-token scorer pooled to the
+same block (`w_ik`). The **granularity is the block** (64 tokens), not the token: a selected
+block contributes all 64 of its keys, and the cost model's 4,864 keys per query assumes exactly
+that. An earlier draft of this chapter described a second per-token stage that the code does not
+implement.
+
+The indexer adds `0.1 · sigmoid(block score)` to the attention logits as a real prior. That
+constant is not cosmetic: audit A3 showed that the previous version used
+`(bonus − bonus.detach())`, which is identically zero in the forward pass, so `w_iq`, `w_ip` and
+`w_ik` changed no logit at all while `backward()` happily gave them gradients. Assertion [4]
+still checks gradient flow; A3 checks that perturbing `w_iq` by 3× changes the logits (7.4e-03).
 
 **Why NoPE here is a mechanism, not a preference.** A rotary layer's score depends on
 relative offset, which is what you want for syntax *inside* a window and exactly what you do
@@ -87,8 +95,8 @@ global layer has is the one the indexer hands it (block index, anchor index). Th
 weakness for local order and a strength for address arithmetic, which is why the two layer
 types are not interchangeable and the pattern is 3:1 rather than 1:1.
 
-Cost of the global layer at 1 M: 4 × 4 × 4,864 × 32 × 128 MACs = 0.29 GFLOP/token, constant in
-context length. The indexer adds `4 × 2 × (n/64 + 32 × 64) × 128`, which grows linearly at
+Cost of the global layer at 1 M: `4 × 4 × 4,864 × 32 × 128 = 0.32 GFLOP/token`, constant in
+context length. The indexer adds `4 × 2 × (n/64 + 8 × 64 + 256) × 128`, which grows linearly at
 one 128-dim dot product per 64-token block — 0.019 GFLOP at 1 M.
 
 ## Rejected alternatives
@@ -99,7 +107,7 @@ one 128-dim dot product per 64-token block — 0.019 GFLOP at 1 M.
   thesis, not because of cost.
 - **16 global NoPE layers.** Recovers recall but removes the only order-sensitive path; local
   syntax (indentation, bracket nesting, operator precedence in text) becomes a bag-of-tokens
-  problem. Also +12 × 0.29 = 3.5 GFLOP/token at 1 M for recall already at ceiling.
+  problem. Also +12 × 0.08 ≈ 0.96 GFLOP/token at 1 M for recall already at ceiling.
 - **8 local + 8 global (alternating).** Balanced as a pipeline too, but doubles the global
   attention FLOPs and the indexer calls for a recall gain the 3:1 pattern already reaches in
   C5; and NoPE layers are the expensive ones at long context.

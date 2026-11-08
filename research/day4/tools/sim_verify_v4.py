@@ -14,13 +14,17 @@ DECAY = 0.55
 PASS_COST = 0.240
 LADDER = (2, 4, 6, 8)
 
-# False-positive rate of each verification regime.  These are inputs, not
-# outputs: blind judge 0.719 (measured, day 3.1); commit-first 0.012 (measured);
-# the Day 4 gates are stated as kill rates against the blind-judge residual.
+# False-positive rate of each verification regime. The first two are measured:
+# blind judge 0.719 and commit-first 0.012 (day 3.1). The Day 4 rows are
+# DERIVED, not measured: each is commit-first's residual multiplied by the
+# stated kill rate of the gate added on top of it. Printing them without that
+# arithmetic is how a modelled number becomes a claimed measurement.
 FPR_BLIND = 0.719
 FPR_COMMIT_FIRST = 0.012
-FPR_MUTANT_GATE = 0.00216
-FPR_VEXX_PLUS_MUTANT = 0.000324
+KILL_RATE_MUTANT = 0.18          # mutant gate removes 82% of residual false accepts
+KILL_RATE_VEXX = 0.027           # VEXX tiers 0-2 remove 97.3% of what is left
+FPR_MUTANT_GATE = FPR_COMMIT_FIRST * KILL_RATE_MUTANT
+FPR_VEXX_PLUS_MUTANT = FPR_COMMIT_FIRST * KILL_RATE_VEXX
 
 # Per-conflict cost from the Kestrel-3.1 cost model (2.91 GFLOP per CoT step).
 COT_STEP_GFLOP = 2.91
@@ -36,14 +40,17 @@ def correlated_ladder(ladder=LADDER, rho=0.78):
     """Depth ladder 2->4->6->8 over Kestrel-4's recurrent workspace.
 
     rho is the retry correlation across deterministic unrolls (day 3.1: 0.78;
-    Kestrel-4's hypothesis codebook decorrelates it to 0.18).  A branch the
-    model has already failed on is not expected to succeed again: conditional
-    passes are discounted by (1 - rho * 0.85).
+    Kestrel-4's hypothesis codebook decorrelates it to 0.18). For exchangeable
+    Bernoulli attempts with correlation rho, P(success | previous failure) =
+    p * (1 - rho) exactly: the covariance is rho * p * (1 - p), so subtracting
+    rho * p from p is the whole of it. An earlier version discounted by
+    (1 - 0.85 * rho), which is a fudge factor with no derivation and made a
+    0.78-correlated retry look 8 points better than it is.
     """
     solved, cost, alive = 0.0, 0.0, 1.0
     for idx, r in enumerate(ladder):
         cost += alive * r * PASS_COST
-        p_eff = p(r) if idx == 0 else p(r) * (1.0 - rho * 0.85)
+        p_eff = p(r) if idx == 0 else p(r) * (1.0 - rho)
         solved += alive * p_eff
         alive *= (1.0 - p_eff)
     return solved, cost
@@ -73,8 +80,10 @@ def main():
     print(f"  Kestrel-4 Hypothesis Codebook (rho=0.18): solved={s_hyp:.3f}  cost={c_hyp:.2f} GFLOP")
 
     print("\n--- 2. Self-Training Poison Rate Across Verification Regimes ---")
-    print("  FPR regimes are the stated gate measurements: blind 0.719, commit-first")
-    print("  0.012, differential-mutant-gate 0.00216, VEXX 1.5 + mutant gate 0.000324.")
+    print("  Regimes: blind 0.719 and commit-first 0.012 are measured; the gate rows")
+    print(f"  are derived as 0.012 x kill rate: mutant 0.012 x {KILL_RATE_MUTANT} = "
+          f"{FPR_MUTANT_GATE:.5f},")
+    print(f"  VEXX+mutant 0.012 x {KILL_RATE_VEXX} = {FPR_VEXX_PLUS_MUTANT:.6f}.")
     regimes = [
         ("Blind (0.719)", FPR_BLIND),
         ("Commit-1st (0.012)", FPR_COMMIT_FIRST),

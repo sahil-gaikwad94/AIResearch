@@ -15,11 +15,16 @@ Everything above is an argument. This chapter is the part that can be wrong in p
 | C7 | 0-DoF splicing pays at batch 1 | wall-clock on 600-token patch | < 1.2× ⇒ gate at ≥ 40 % deterministic | 6 CPU-h |
 | C8 | Verifier is sound and complete enough | 10⁶ adversarial documents | any accepted-invalid; rejected-valid > 1e-4 | 40 CPU-h |
 | C9 | Self-training is safe at 40 % solve | poison rate of the stack | > 0.1 % ⇒ no unattended distillation | 180 GPU-h |
+| C10 | Chunked BPTT beats per-step detach | parity / validation loss at equal tokens | < 1 point gain ⇒ detach every step | 60 GPU-h |
+| C11 | The indexer prior is used, not just differentiable | logit sensitivity + ablation loss | no gain ⇒ drop the prior and the indexer path | 40 GPU-h |
+| C12 | A block-summary KV hierarchy preserves recall at 1 M | exact recall, bytes/sequence | < 90 % recall ⇒ keep the 4.29 GB cache | 20 GPU-h |
 
-Total cost of the falsification programme ≈ 3,300 GPU-h, 13 % of the 25,067 GPU-h budget. That
+Total cost of the falsification programme ≈ 3,427 GPU-h, 14.6 % of the 23,530 GPU-h budget. That
 is the price of being allowed to say the numbers are real, and it is paid *before* the large
-runs, in the order C8 → C4 → C7 → C6 → C1 → C3 → C5 → C2 → C9. The cheap ones come first
-because they can delete a mechanism before it costs a training run.
+runs, in the order C8 → C11 → C7 → C10 → C4 → C6 → C1 → C3 → C5 → C2 → C9. The cheap ones come
+first because they can delete a mechanism before it costs a training run — and because the
+first audit already showed that the mechanisms most likely to be inert are the cheapest ones
+to test (C11 costs 40 GPU-h and caught a path with zero influence on the model's output).
 
 ## Failure modes that are not in the table
 
@@ -55,7 +60,16 @@ one place where a correct mask can still produce an incorrect token.
 **Certificate forgery.** Before A5, `verify_certificate` accepted a signed certificate with no
 trusted key. The L3 memory store's SHA-256 witness is now only meaningful when the verifier is
 given a key; without one, verification fails closed. Any deployment that wants content-addressed
-memory to mean something must provision the key.
+memory to mean something must provision the key. The same failure was found one level up in
+`kestrel4/model.py`: `emit_l3_proof_certificate` returned `verified: True` without checking
+anything (audit A6). It now evaluates linear checks with exact `Fraction` arithmetic and
+returns `False` when no checks are supplied.
+
+**Signed-container residual checks.** The tier-1 volume twist masks `v > C` where `C` is the
+remaining container capacity. That is correct only when container elements are non-negative;
+with signed elements a large negative value passes a check it should fail. Kestrel-4's schemas
+are non-negative by construction, but the runtime does not enforce it, so this is a documented
+limitation rather than a proven-safe case.
 
 ## What would falsify the whole thesis
 
@@ -73,7 +87,7 @@ Three outcomes would be enough, and any one of them is sufficient:
    satisfy it, which is a different product.
 
 The design is deliberately arranged so that each of these is cheap to discover relative to the
-cost of the full training run. That is what the 3,300 GPU-h is for.
+cost of the full training run. That is what the 3,427 GPU-h is for.
 
 ## Residual risks that no ablation covers
 

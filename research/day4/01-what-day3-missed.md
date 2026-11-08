@@ -143,7 +143,7 @@ and are load-bearing in day 4:
 - **Commit-first verification.** Making the judge answer before seeing the candidate drops the
   false-positive rate from 0.719 to 0.012. That is a mechanism, not a prompt trick, and day 4
   keeps it as tier-0 behaviour in §04.
-- **The workspace rent argument.** A 4-layer recurrent workspace costs 12.3× less per token
+- **The workspace rent argument.** A 4-layer recurrent workspace costs 14.2× less per token
   than a decoded token while adding depth only where the model asks for it. It survives into
   Kestrel-4 as `CodeJEPAWorkspace`.
 - **Validity over capacity.** The VibeMemBench result — 11 of 12 memory systems fail to beat no
@@ -162,3 +162,32 @@ not. Day 4 therefore adds three checks that a formula cannot satisfy:
 3. **Test the property, not the shape.** Absorption is asserted by comparing two forward
    passes (8.94e-08), not by checking that the matrix exists; routing rank is asserted by
    multiplying out the active groups, not by checking `n_experts`.
+
+## The second pass: auditing day 4 itself
+
+The rules above were written for days 1–3.1, so the first thing to do with them was point them
+at day 4. `tools/audit_v4.py` is that harness: 21 checks, each of which tries to refute a claim
+in these chapters by measuring the mechanism in `kestrel4/model.py`. The first run refuted
+**13 of them**, and two were the same failure class as day 3.1's RoPE — a mechanism that is
+counted, initialized, and inert:
+
+| # | Claim | Measured | Root cause |
+|---|---|---|---|
+| A1 | the memory's transition has a negative eigenvalue | `λ_min = 0.93` — never negative | a delta-rule step `η=0.05` was applied where a reflection was described; the assertion checked `β > 1`, which is true of any sigmoid |
+| A2 | a memory layer preserves the residual stream | out/in RMS `0.01` | `Block` fed the memory `RMSNorm(x)` and the memory returned `+ x`, replacing the stream with a normalized copy |
+| A3 | the indexer changes the forward pass | influence `0.0` | `(bonus − bonus.detach())` is zero in forward and only fabricates a gradient |
+| A4 | FLOPs match the documented decomposition | +7.1 % to +11.9 % | one workspace pass double-counted, indexer over-charged by 2.7× |
+| A5 | retries are discounted by `p(1−ρ)` | `p(1−0.85ρ)` | a fudge factor with no derivation |
+| A6 | a violating witness is not certified | `verified: True` | the certificate was a hash, not a check |
+| A7 | domain cuts keep the domain non-empty | `(0.05, 0.01)` | repeated half-space cuts were never bounded |
+| A8 | the workspace respects its configured window | 0.876 of attention leaked | `4096` hard-coded instead of the config |
+| A9 | per-component parameter counts match | all five match | — (this one held) |
+
+All thirteen are fixed. A1 is now an empirical measurement of the implemented step (`β = 1.8 ⇒
+λ = −0.800`, `β = 2 ⇒ H² = I` to 2.4e-07), A3 uses a real 0.1 logit prior instead of a fake
+gradient, A6 verifies linear checks with `Fraction`, and the cost model is cross-checked by an
+independently written decomposition (0.00 % disagreement at every `r`).
+
+The lesson is the one this chapter opened with, applied one level up: **the formula is not the
+mechanism, and an assertion that recomputes the formula cannot tell you which one you built.**
+The harness lives in the repository so the next draft has to pass it.

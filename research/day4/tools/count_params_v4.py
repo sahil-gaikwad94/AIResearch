@@ -33,13 +33,18 @@ def flops_fwd(ctx=65536, r=2):
     width heads*(dh + d_rope).  The window caps the local layers; the global
     layer reads its window plus its selected blocks plus its anchors."""
     lin_active = ACTIVE - EMBED - WS
-    dense = 2 * (lin_active + r * WS)
-    w_eff = min(ctx, W)
+    # ACTIVE already contains one workspace pass, so iteration 1 adds no linear work.
+    dense = 2 * (lin_active + max(0, r - 1) * WS)
+    w_eff = min(ctx, V.get("w_window", W))
     att_loc = V["local_layers"] * 4 * w_eff * V["heads"] * (V["dh"] + V["d_rope"])
     g_eff = min(ctx, W + V["sel_topk"] * V["sel_block"] + V["anchor_budget"])
     att_glb = V["global_nope_layers"] * 4 * g_eff * V["heads"] * V["dh"]
-    idx = V["global_nope_layers"] * 2 * ((ctx // V["sel_block"]) + 32 * V["sel_block"]) * V["idx_dim"]
-    w_att = V["w_layers"] * r * 2 * 4 * w_eff * V["d_w"]
+    # Block scores (one dot product per 64-token block) plus the selected blocks
+    # and the anchors, which are re-scored at token granularity.
+    idx_keys = (ctx // V["sel_block"]) + V["sel_topk"] * V["sel_block"] + V["anchor_budget"]
+    idx = V["global_nope_layers"] * 2 * idx_keys * V["idx_dim"]
+    w_heads = V["d_w"] // V["d_head_h"]
+    w_att = V["w_layers"] * r * 2 * 2 * w_heads * w_eff * V["d_head_h"]
     return dense + att_loc + att_glb + idx + w_att
 
 
@@ -104,15 +109,19 @@ def main():
     exp_mb = (3 * V["d_lat"] * V["d_ff"]) * 0.55 / 1e6   # one expert at 4-bit
     patch_tokens = 600
     splice_save = 0.28        # 0-DoF splicing skips 28% of the decode steps
+    splice_us = 16.0          # CPU cost per spliced token, per sequence
+    splice_cores = 4          # sequences spliced in parallel on CPU
     for b in (1, 16, 64):
         distinct_per_layer = V["n_experts"] * (1 - (1 - 1 / V["n_experts"]) ** (b * V["top_k"]))
         routed_gb = L * distinct_per_layer * exp_mb / 1000.0
         step_gb = always_gb + routed_gb
         step_ms = step_gb * 1e9 / BW * 1e3                # ms for the whole batch step
         raw_patch_ms = patch_tokens * step_ms / b
-        # Net: 0-DoF splicing removes 28% of the steps; the remaining steps pay a
-        # 16 us CPU splicing overhead per token.
-        net_patch_ms = (step_ms / b) * (1.0 - splice_save) * patch_tokens + patch_tokens * 0.016 / b
+        # Net: 0-DoF splicing removes 28% of the steps. The remaining steps pay a
+        # 16 us CPU cost per spliced token; b sequences can be spliced on up to
+        # `splice_cores` cores, so the CPU term does not shrink below that floor.
+        cpu_ms = patch_tokens * splice_us / 1000.0 / min(b, splice_cores)
+        net_patch_ms = (step_ms / b) * (1.0 - splice_save) * patch_tokens + cpu_ms
         print(f"  batch={b:2d}: {distinct_per_layer:5.1f} exp/layer -> {step_gb:5.2f} GB/step "
               f"({step_ms:.3f} ms/step)")
         print(f"      {patch_tokens}-token patch: raw {raw_patch_ms:6.2f} ms  ->  "

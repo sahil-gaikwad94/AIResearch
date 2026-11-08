@@ -5,24 +5,25 @@ against doing nothing.
 
 ## The decode budget
 
-Forward FLOPs per token, from `tools/count_params_v4.py`:
+Forward FLOPs per token, from `tools/count_params_v4.py`, cross-checked against an independent
+decomposition by `tools/audit_v4.py`:
 
 | `r` | @4 k | @64 k | @1 M |
 |---:|---:|---:|---:|
-| 1 | 4.68 GFLOP | 4.73 | 4.75 |
-| 2 | 5.06 | 5.11 | 5.12 |
-| 4 | 5.80 | 5.86 | 5.87 |
-| 8 | 7.30 | 7.35 | 7.37 |
+| 1 | 4.37 GFLOP | 4.42 | 4.44 |
+| 2 | 4.68 | 4.73 | 4.75 |
+| 4 | 5.29 | 5.35 | 5.36 |
+| 8 | 6.52 | 6.58 | 6.59 |
 
 Two things to read from this table. First, **context is nearly free**: going from 4 k to 1 M
-adds 0.07 GFLOP/token (1.5 %), because the local layers are windowed and the global layers
-read 4,864 selected keys regardless of length. Second, **depth is not**: `r = 8` costs 56 %
+adds 0.07 GFLOP/token (1.6 %), because the local layers are windowed and the global layers
+read 4,864 selected keys regardless of length. Second, **depth is not**: `r = 8` costs 49 %
 more than `r = 1`. The recurrent dial is the expensive axis, which is why it is a dial.
 
-The workspace accounts for most of that slope: one extra iteration costs
-`2 × 120,084,482` dense FLOPs plus workspace attention ≈ 0.38 GFLOP/token, and 7 extra
-iterations ≈ 2.6 GFLOP — the 4.68 → 7.30 difference. A decoded token at `r = 1` thus costs
-12.3× a workspace iteration, which is day 3.1's rent argument, still true.
+The workspace accounts for most of that slope: one extra iteration costs **0.307 GFLOP/token**
+(`r = 2` minus `r = 1`), and 7 extra iterations cost 2.15 GFLOP — the 4.37 → 6.52 difference. A
+decoded token at `r = 1` thus costs **14.2×** a workspace iteration, which is day 3.1's rent
+argument with the corrected arithmetic.
 
 ## CRANE: two modes, one model
 
@@ -52,14 +53,16 @@ candidate value `v` is admissible if `v ∈ [lo, hi]` and `v ≤ C`. Among admis
 the twist adds
 
 ```
-β · log( min(hi, C) − v )  /  (hi − lo),     β = 0.5
+β · log( min(hi, C) − v ) / (hi − lo),     β = 0.5
 ```
 
 so a value that leaves more residual polytope volume is favoured. Assertion [8] checks both
 halves on real logits: the out-of-bounds candidate 0.65 is `-inf`, and the wider-residual
 candidate 0.10 outscores 0.45. This is a *soft* preference on top of a *hard* mask — the mask
 is what makes it sound, and the twist is only allowed to reorder what the mask already
-permitted.
+permitted. The hard comparison `v ≤ C` assumes non-negative container elements, which is true
+for the schemas Kestrel-4 targets; a signed container needs the residual check to account for
+the sign, and §08 records that as a known limitation rather than a solved case.
 
 ## 0-DoF splicing: skip the token entirely
 
@@ -68,24 +71,24 @@ not a prediction; it is an evaluation, and the model should not be sampled at al
 computes the canonical text, heals the BPE boundary against the last emitted token, and splices
 the tokens into the stream.
 
-The saving is not per-token arithmetic, it is per-token *steps*: 28 % of decode steps in a
-typical structured patch are deterministic. Against a 600-token patch:
+The saving is per-token *steps*: 28 % of decode steps in a typical structured patch are
+deterministic. Against a 600-token patch:
 
-| Batch | GB/step | Raw | With 0-DoF | Speedup | tok/s |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 0.84 | 150.71 ms | 118.11 ms | **1.28×** | 5,080 |
-| 16 | 3.92 | 43.93 ms | 32.23 ms | **1.36×** | 18,617 |
-| 64 | 8.86 | 24.79 ms | 18.00 ms | **1.38×** | 33,330 |
+| Batch | Raw | With 0-DoF | Speedup | tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 150.71 ms | 118.11 ms | **1.28×** | 5,080 |
+| 16 | 43.93 ms | 34.03 ms | **1.29×** | 17,633 |
+| 64 | 24.79 ms | 20.25 ms | **1.22×** | 29,627 |
 
-The model charges 16 µs of CPU splicing overhead per token, which is why the speedup is not
-1/0.72 = 1.39× at batch 1: at low batch the CPU cost is exposed, and it is repaid only when
-the deterministic fraction is high. The crossover is at 16 µs / 251 µs ≈ 6.4 % deterministic
-fields (`f · T = 16 µs`); below that, 0-DoF is a loss. That is the honest boundary, and it is why the mechanism is gated on a
-runtime count rather than enabled globally.
+The model charges 16 µs of CPU splicing per token and assumes 4 sequences can be spliced in
+parallel on 4 cores, so the CPU term stops shrinking at batch 4. That is why the speedup
+*falls* at batch 64 (1.22×): batching amortizes the GPU step but not the splices, and 600
+splices cost 2.4 ms whether the batch is 16 or 64. The first version of this table divided the
+CPU cost by the batch size, which produced a 1.38× that no scheduler could deliver.
 
-Note what the table does *not* claim: splicing does not reduce the FLOPs of the remaining
-steps. It reduces their number. A patch with 0 % deterministic fields runs at exactly the raw
-speed.
+The crossover is at `16 µs / 251 µs ≈ 6.4 %` deterministic fields at batch 1 (`f · T = 16 µs`);
+below that, 0-DoF is a loss. Note what the table does *not* claim: splicing does not reduce the
+FLOPs of the remaining steps, it reduces their number.
 
 ## CDCL jumpback: the third use of the same 600 tokens
 
@@ -107,9 +110,13 @@ token 9 with entropy 0.6, both in the core. The controller rewinds to **token 4*
 tightens `w1`'s upper bound to 0.43.
 
 The rewind also snaps the fast-weight states back to the checkpoint, so the memory does not
-carry the refuted branch forward — that is the reason the checkpoint stores `states`, not just
-token positions. A jumpback that restored tokens but not state would silently duplicate the
-error it was repairing.
+carry the refuted branch forward — that is why the checkpoint stores `states`, not just token
+positions. A jumpback that restored tokens but not state would silently duplicate the error it
+was repairing.
+
+A cut that would empty the domain is now refused (audit A7): the clause is marked exhausted and
+the bound is left alone, because an empty domain makes every continuation illegal and turns one
+bad clause into a dead session. The old code produced `(0.05, 0.01)` after four conflicts.
 
 ## Rejected alternatives
 
@@ -121,9 +128,8 @@ error it was repairing.
   600-token patch degenerates to whole-patch retry when the conflict is early, and it rewinds
   to the *last* clause, which is usually not the culprit.
 - **Speculative decoding with a draft model.** Reduces per-token latency but not per-token
-  count, and a draft model that does not know the constraint system will propose tokens that
-  the mask then throws away. 0-DoF splicing removes work that is *known*, which is a different
-  and better-conditioned 30 %.
+  count, and a draft model that does not know the constraint system proposes tokens the mask
+  then throws away. 0-DoF splicing removes work that is *known*, which is better conditioned.
 - **Unconstrained reasoning with a separate extraction pass.** Two passes over the same tokens
   for a guarantee that the second pass cannot provide (extraction is a model, not a verifier).
 

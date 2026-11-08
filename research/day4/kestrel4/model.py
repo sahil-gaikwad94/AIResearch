@@ -29,7 +29,7 @@ import torch.nn.functional as F
 FULL = dict(
     vocab=131072, d=4096, heads=32, dh=128, d_c=512, d_rope=64,
     layers=16, local_layers=12, global_nope_layers=4,
-    global_layer_indices=(3, 7, 11, 15), window=4096,
+    global_layer_indices=(3, 7, 11, 15), window=4096, w_window=4096,
     sel_block=64, sel_topk=8, anchor_budget=256, idx_dim=128,
     d_m=512, r_m=256, n_householder=2,
     n_groups=8, experts_per_group=32, n_experts=256,
@@ -132,9 +132,12 @@ class GlobalNoPESparseMLA(nn.Module):
         self.w_uv = nn.Linear(dc, h * dh, bias=False)
         self.w_o = nn.Linear(h * dh, d, bias=False)
         self.sinks = nn.Parameter(torch.zeros(h))
-        self.w_iq = nn.Linear(d, idx, bias=False)     # coarse block query
-        self.w_ip = nn.Linear(dc, idx, bias=False)    # coarse pooled-block scorer
-        self.w_ik = nn.Linear(dc, idx, bias=False)    # fine token-level scorer
+        self.w_iq = nn.Linear(d, idx, bias=False)     # block query from the token
+        self.w_ip = nn.Linear(dc, idx, bias=False)    # pooled-latent block scorer
+        self.w_ik = nn.Linear(dc, idx, bias=False)    # per-token scorer, pooled to blocks
+        # Logit prior from the indexer. Fixed, not learned, so the ledger stays
+        # exact; without it the indexer never touches the forward pass at all.
+        self.indexer_bias = 0.1
 
     def forward(self, x, anchors=None):
         b, n, _ = x.shape
@@ -154,6 +157,12 @@ class GlobalNoPESparseMLA(nn.Module):
         fine_k = self.w_ik(ckv_pad).view(b, nb, bs, -1).mean(dim=2)
         iq = self.w_iq(x)
         blk_scores = torch.einsum("bnd,bmd->bnm", iq, 0.5 * (coarse_k + fine_k)) / math.sqrt(iq.shape[-1])
+        pos = torch.arange(n, device=x.device)
+        block_start = torch.arange(nb, device=x.device) * bs            # [nb]
+        visible = block_start[None, :] <= pos[:, None]                  # [n, nb]
+        # A block whose first token is in the future can never be attended to; do
+        # not spend a top-k slot on it.
+        blk_scores = blk_scores.masked_fill(~visible.unsqueeze(0), float("-inf"))
 
         k_sel = min(self.topk, nb)
         _, top_idx = blk_scores.topk(k_sel, dim=-1)
@@ -161,7 +170,6 @@ class GlobalNoPESparseMLA(nn.Module):
         sel_mask.scatter_(2, top_idx, True)
         tok_sel = sel_mask.repeat_interleave(bs, dim=2)[:, :, :n]
 
-        pos = torch.arange(n, device=x.device)
         causal = pos[:, None] >= pos[None, :]
         win = (pos[:, None] - pos[None, :]) < self.window
         mask = (win[None] | tok_sel) & causal[None]
@@ -171,8 +179,11 @@ class GlobalNoPESparseMLA(nn.Module):
             mask = mask | (anchor_mask & causal[None])
 
         att = (q @ k.transpose(-1, -2)) / math.sqrt(dh)
+        # A real prior from the indexer, not a fabricated gradient: the old
+        # `bonus - bonus.detach()` was numerically zero in the forward pass, so
+        # w_iq / w_ip / w_ik could not change a single logit.
         idx_bonus = torch.sigmoid(blk_scores).repeat_interleave(bs, dim=2)[:, :, :n]
-        att = att + 1e-3 * (idx_bonus - idx_bonus.detach()).unsqueeze(1)
+        att = att + self.indexer_bias * idx_bonus.unsqueeze(1)
         att = att.masked_fill(~mask.unsqueeze(1), float("-inf"))
 
         sink = self.sinks.view(1, h, 1, 1).expand(b, h, n, 1)
@@ -180,8 +191,26 @@ class GlobalNoPESparseMLA(nn.Module):
         return self.w_o((att @ v).transpose(1, 2).reshape(b, n, h * dh))
 
 
+def householder_step(state, u, beta):
+    """Apply one generalized Householder reflection on the left.
+
+    ``state`` is ``[b, r, d_m]``, ``u`` is a unit vector ``[b, d_m]`` and ``beta``
+    is ``[b]`` in ``(0, 2)``. The map is ``B <- (I - beta u u^T) B``, whose
+    eigenvalue on the ``u`` axis is ``1 - beta``: negative for ``beta > 1`` and
+    exactly ``-1`` at ``beta = 2``. That sign is why the transition can represent
+    an order-2 group element; a delta rule with a small step cannot.
+    """
+    proj = state @ u.unsqueeze(-1)                       # [b, r, 1]
+    return state - beta[:, None, None] * proj * u.unsqueeze(1)
+
+
 class HouseholderDeltaProductMemory(nn.Module):
-    """DeltaProduct fast weights (Siems et al. 2025; Grazzi et al. 2025)."""
+    """DeltaProduct fast weights (Siems et al. 2025; Grazzi et al. 2025).
+
+    Two generalized Householder reflections form the transition; there is no free
+    step size on it, because ``beta in (0, 2)`` *is* the spectrum. The value write
+    is one delta-rule step with a fixed buffer of 1.0, so the ledger does not grow.
+    """
 
     def __init__(self, c):
         super().__init__()
@@ -195,7 +224,8 @@ class HouseholderDeltaProductMemory(nn.Module):
         self.g = nn.Linear(d, dm, bias=False)
         self.o = nn.Linear(dm, d, bias=False)
         self.A = nn.Parameter(torch.randn(dm, rm) / math.sqrt(dm))
-        self.eta = 0.05
+        self.register_buffer("eta", torch.ones(1))       # delta-rule write step
+        self.chunk = 64                                   # chunked BPTT length
 
     def init_state(self, b, device):
         return torch.zeros(b, self.r, self.dm, device=device)
@@ -215,15 +245,20 @@ class HouseholderDeltaProductMemory(nn.Module):
         reads = []
         for t in range(n):
             qt, k1t, k2t, vt = q[:, t], k1[:, t], k2[:, t], v[:, t]
-            b1 = betas[:, t, 0:1].unsqueeze(-1)
-            b2 = betas[:, t, 1:2].unsqueeze(-1)
+            b1 = betas[:, t, 0]
+            b2 = betas[:, t, 1]
             reads.append(self.A @ (B @ qt.unsqueeze(-1)))
-            err1 = (self.A @ (B @ k1t.unsqueeze(-1))).squeeze(-1) - vt
-            B = B - (self.eta * b1) * ((err1 @ self.A).unsqueeze(-1) @ k1t.unsqueeze(1))
-            proj2 = B @ k2t.unsqueeze(-1)
-            B = B - (self.eta * b2) * (proj2 @ k2t.unsqueeze(1))
+            # DeltaProduct transition: B <- H2 H1 B, with H_i = I - b_i u_i u_i^T.
+            # b in (0, 2) puts the eigenvalue 1 - b in (-1, 1): a real sign flip.
+            B = householder_step(B, k1t, b1)
+            B = householder_step(B, k2t, b2)
+            # Content write: one delta-rule step toward v, size eta = 1.
+            err = (self.A @ (B @ k1t.unsqueeze(-1))).squeeze(-1) - vt
+            B = B - self.eta * (err @ self.A).unsqueeze(-1) * k1t.unsqueeze(1)
+            if self.chunk and (t + 1) % self.chunk == 0:
+                B = B.detach()                                # chunked BPTT
         y = torch.stack(reads, dim=1).squeeze(-1)
-        return self.o(gate * y) + x, B.detach()
+        return self.o(gate * y), B.detach()
 
 
 class SwiGLU(nn.Module):
@@ -303,6 +338,7 @@ class WorkspaceLayer(nn.Module):
     def __init__(self, c):
         super().__init__()
         dw, d = c["d_w"], c["d"]
+        self.window = int(c.get("w_window", c.get("window", 4096)))
         self.n1 = nn.RMSNorm(dw)
         self.q = nn.Linear(dw, dw, bias=False)
         self.kv = nn.Linear(d, 2 * dw, bias=False)
@@ -317,7 +353,7 @@ class WorkspaceLayer(nn.Module):
         b, n, dw = h.shape
         q = self.q(self.n1(h))
         k, v = self.kv(ctx).chunk(2, dim=-1)
-        m = _window_mask(n, min(4096, n), h.device)
+        m = _window_mask(n, min(self.window, n), h.device)
         a = ((q @ k.transpose(-1, -2)) / math.sqrt(dw)).masked_fill(~m, float("-inf")).softmax(-1)
         h = h + self.o(a @ v)
 
@@ -388,7 +424,8 @@ class Block(nn.Module):
             x = x + self.attn(self.n1(x), anchors=anchors)
         else:
             x = x + self.attn(self.n1(x))
-        x, state = self.mem(self.n2(x), state)
+        delta, state = self.mem(self.n2(x), state)
+        x = x + delta
         x = x + self.moe(self.n3(x))
         return x, state
 
@@ -432,6 +469,7 @@ class VexxNeuroSymbolicController:
         self.twist_beta = twist_beta
         self.checkpoints = []
         self.dpo_pairs = []
+        self.exhausted = set()
 
     def save_clause_checkpoint(self, clause_id, token_idx, states, mean_entropy, assigned_val):
         self.checkpoints.append({
@@ -464,7 +502,7 @@ class VexxNeuroSymbolicController:
         k_curr = len(self.checkpoints)
         best_score, culprit_idx = -1e9, 0
         for idx, cp in enumerate(self.checkpoints):
-            if cp["clause_id"] in unsat_core_ids:
+            if cp["clause_id"] in unsat_core_ids and cp["clause_id"] not in self.exhausted:
                 score = cp["entropy"] * math.exp(-lam * (k_curr - idx)) + gamma * cp["conflicts"]
                 if score > best_score:
                     best_score, culprit_idx = score, idx
@@ -473,7 +511,14 @@ class VexxNeuroSymbolicController:
         # Half-space domain cut: tighten the upper bound below the offending value.
         cid = culprit["clause_id"]
         lo, hi = self.bounds.get(cid, (0.0, 1.0))
-        self.bounds[cid] = (lo, math.nextafter(culprit["val"] - 0.05, -float("inf")))
+        cut = math.nextafter(culprit["val"] - 0.05, -float("inf"))
+        if cut >= lo:
+            self.bounds[cid] = (lo, cut)
+        else:
+            # Cutting again would empty the domain, which makes every continuation
+            # illegal and turns one bad clause into a dead session. Record it and
+            # stop cutting instead.
+            self.exhausted.add(cid)
         # Record the step-level DPO tuple (TrajectoryCollector).
         self.dpo_pairs.append({
             "culprit_clause": cid,
@@ -485,14 +530,32 @@ class VexxNeuroSymbolicController:
         return culprit["token_idx"], [s.clone() for s in culprit["states"]]
 
     @staticmethod
-    def emit_l3_proof_certificate(symbol_key, witness_dict, smt2_assertions):
-        payload = f"{symbol_key}|{sorted(witness_dict.items())}|{smt2_assertions}".encode("utf-8")
+    def emit_l3_proof_certificate(symbol_key, witness_dict, smt2_assertions, checks=None):
+        """Emit a content-addressed witness plus exact-Rational checks.
+
+        ``checks`` is a list of ``(coeffs, rhs)`` linear equalities evaluated with
+        ``Fraction`` on the witness. ``verified`` is *earned* by those checks and is
+        ``False`` when none are supplied: a certificate nobody verified is a
+        comment. The SMT-LIB2 text is an artifact for an external checker, and is
+        reported as unchecked rather than implied to have run.
+        """
+        from fractions import Fraction
+
+        checks = list(checks or [])
+        verified = bool(checks)
+        for coeffs, rhs in checks:
+            lhs = sum(Fraction(str(coeffs[k])) * Fraction(str(witness_dict[k])) for k in coeffs)
+            verified = verified and lhs == Fraction(str(rhs))
+        payload = (f"{symbol_key}|{sorted(witness_dict.items())}|{smt2_assertions}|"
+                   f"{sorted((tuple(sorted(c.items())), str(r)) for c, r in checks)}").encode("utf-8")
         digest = hashlib.sha256(payload).hexdigest()
         return {
             "symbol_key": symbol_key,
             "sha256_witness": digest,
             "smtlib2": f"(set-logic QF_LRA)\n{smt2_assertions}\n(check-sat)",
-            "verified": True,
+            "verified": verified,
+            "smtlib2_checked": False,
+            "checks": len(checks),
         }
 
 
@@ -658,8 +721,16 @@ def main():
           f"new_bound={vexx.bounds['w1'][1]:.2f}  dpo_pairs=1  ok")
 
     # [9] VEXX 1.5 ProofCertificate for L3 Memory Store
-    cert = vexx.emit_l3_proof_certificate("pkg.auth.Session", {"w1": 0.40, "w2": 0.60}, "(assert (= (+ w1 w2) 1.0))")
+    cert = vexx.emit_l3_proof_certificate(
+        "pkg.auth.Session", {"w1": 0.40, "w2": 0.60}, "(assert (= (+ w1 w2) 1.0))",
+        checks=[({"w1": 1, "w2": 1}, 1.0)],
+    )
+    forged = vexx.emit_l3_proof_certificate(
+        "pkg.auth.Session", {"w1": 0.90, "w2": 0.90}, "(assert (= (+ w1 w2) 1.0))",
+        checks=[({"w1": 1, "w2": 1}, 1.0)],
+    )
     assert len(cert["sha256_witness"]) == 64 and cert["verified"]
+    assert forged["verified"] is False, "a violating witness was certified"
     print(f"[9] proof   sha256={cert['sha256_witness'][:16]}...  smtlib2_verified=True  ok")
 
     # [10] End-to-end forward pass + backward pass

@@ -59,18 +59,24 @@ implementation, tested once.
 
 Four regimes, each a mechanism rather than a tuning knob:
 
-| Regime | Mechanism | FPR |
-|---|---|---:|
-| Blind self-play | judge sees candidate, no commitment | 0.719 |
-| Commit-first | judge commits its own answer before seeing candidate | 0.012 |
-| Differential mutant gate | candidate must kill generated mutants that the reference passes | 0.00216 |
-| VEXX 1.5 + mutant gate | tier 0–2 reject before the mutant gate is consulted | 0.000324 |
+| Regime | Mechanism | FPR | Source |
+|---|---|---:|---|
+| Blind self-play | judge sees candidate, no commitment | 0.719 | measured |
+| Commit-first | judge commits its own answer before seeing candidate | 0.012 | measured |
+| Differential mutant gate | candidate must kill generated mutants that the reference passes | 0.00216 | derived: `0.012 × 0.18` |
+| VEXX 1.5 + mutant gate | tier 0–2 reject before the mutant gate is consulted | 0.000324 | derived: `0.012 × 0.027` |
 
-The last row is the only one that is a property of the *runtime* rather than of a prompt.
-0.000324 is 37× below commit-first and 6.7× below the mutant gate alone; it is not the product
-of the three because the failures are correlated (a schema-blind judge and a mutant gate miss
-the same class of off-by-one errors). Reporting the product would be exactly the kind of
-arithmetic this chapter exists to forbid.
+The last two rows are **derived, not measured**, and the derivation is the whole story: each is
+commit-first's residual multiplied by the *kill rate* the added gate claims (82 % for the
+mutant gate, 97.3 % for tiers 0–2). An earlier draft printed `0.00216` and `0.000324` as though
+measurements had produced them — one multiplication away from the sin this chapter is about.
+The kill rates are the assumptions to attack: C8 and C9 exist to test them, and the numbers are
+only as good as that test.
+
+Why not simply multiply the three mechanisms? Because their failures are correlated: a
+schema-blind judge and a mutant gate miss the same class of off-by-one error, so the product
+would be optimistic even if every factor were measured. The composite is a *modelled posterior
+under stated conditional independence within each gate*, and it is labelled as such.
 
 ## What the composite buys in self-training
 
@@ -135,6 +141,8 @@ declaring an exponent-tolerant domain.
 - Python: 429 passed, 41 skipped (`pytest vexx/tests`; skips are the native-extension parity
   tests, which require the compiled wheel).
 - The five holes above are covered by tests that fail on the pre-fix code.
+- `tools/audit_v4.py` audits the *serving* claims of this document set, including the
+  certificate path: 21/21 checks pass after the audit fixed 13 refuted claims (§01, §09.4).
 - The working-tree diff is preserved as [`vexx-soundness.patch`](vexx-soundness.patch) so the
   fixes are reviewable from this repository rather than only from a local clone.
 

@@ -26,14 +26,21 @@ independent draw:
 | Assumption | Correlation `ρ` | Solved | Cost |
 |---|---:|---:|---:|
 | Independent retries | 0.00 | 0.963 | 1.54 GFLOP |
-| Deterministic, unconditioned | 0.78 | 0.716 | 2.35 GFLOP |
-| Kestrel-4 hypothesis codebook | 0.18 | **0.932** | **1.70 GFLOP** |
+| Deterministic, unconditioned | 0.78 | 0.635 | 2.52 GFLOP |
+| Kestrel-4 hypothesis codebook | 0.18 | **0.926** | **1.73 GFLOP** |
 
-`ρ` is the correlation between successive attempt outcomes: with `ρ = 0.78`, four retries behave
-like ~1.2 independent draws, so the ladder buys 25 points of solve rate less than the
-independent model predicted while costing 53 % more (the failed attempts are paid for and
-return nothing). This is the single largest economic error in day 3.1, and it is not a coding
-bug: it is an assumption that was never written down as an assumption.
+`ρ` is the correlation between successive attempt outcomes. For exchangeable Bernoulli attempts
+the conditional identity is exact: `P(success | previous failure) = p (1 − ρ)`, because the
+covariance is `ρ p (1 − p)` and subtracting `ρ p` from `p` is the whole correction. With
+`ρ = 0.78` four retries therefore behave like ~1.2 independent draws: the ladder buys 33 points
+of solve rate less than the independent model predicted while costing 64 % more (the failed
+attempts are paid for and return nothing). This is the single largest economic error in day
+3.1, and it is not a coding bug: it is an assumption that was never written down as one.
+
+An earlier draft of this chapter used `p (1 − 0.85 ρ)` instead of `p (1 − ρ)`. That is a fudge
+factor with no derivation, and it made the 0.78-correlated case look 8 points better than it is
+(0.716 rather than 0.635). The audit caught it (A5); the honest number strengthens the argument
+for the codebook, which is why it was worth catching.
 
 The fix is not "retry more"; it is **make the retry a different question**. The hypothesis
 codebook (`K = 8` orthogonal embeddings `z_k`, 8,192 parameters) conditions the workspace on an
@@ -78,10 +85,11 @@ pairs rather than 10⁵ trajectories.
 - query-attentive pooling for patch confidence;
 - `K = 8` hypothesis embeddings.
 
-Cost per extra iteration is `2 × (active workspace) + attention`, i.e. 0.38 GFLOP/token at
-`r` from 1 to 2, against 5.06 GFLOP/token for the trunk at `r = 2`. Day 3.1's rent argument —
-a workspace iteration costs 12.3× less than a decoded token — survives; what day 4 adds is
-that the iteration is *conditioned*, which is what makes it worth renting.
+Cost per extra iteration is `2 × (active workspace) + attention`, i.e. **0.307 GFLOP/token** at
+`r` from 1 to 2, against 4.37 GFLOP/token for the trunk at `r = 1`. Day 3.1's rent argument —
+a workspace iteration costs **14.2×** less than a decoded token — survives, with the corrected
+arithmetic. What day 4 adds is that the iteration is *conditioned*, which is what makes it
+worth renting at all.
 
 ## Rejected alternatives
 
@@ -94,13 +102,13 @@ that the iteration is *conditioned*, which is what makes it worth renting.
 - **Outcome-level RL (RLHF/PPO on final reward).** One bit per trajectory, credit assignment
   over hundreds of tokens, and a reward model that reintroduces exactly the 0.719 failure.
 - **Independent-retry assumption.** Kept as the *baseline* in the table above, not as a design
-  assumption, because the gap between 0.963 and 0.716 is the cost of pretending `ρ = 0`.
+  assumption, because the gap between 0.963 and 0.635 is the cost of pretending `ρ = 0`.
 
 ## Falsifier
 
 **C6 — hypothesis codebook.** Fix the token budget and the depth ladder; compare `K = 8`
 against `K = 1` (no conditioning) at equal GFLOP. Kill the codebook if the solved-rate gain is
-below 5 points, or if measured `ρ` does not fall below 0.4. The simulation predicts 0.932 vs
-0.716 solved at 1.70 vs 2.35 GFLOP; if the real gain is under 5 points, 8,192 parameters and a
+below 5 points, or if measured `ρ` does not fall below 0.4. The simulation predicts 0.926 vs
+0.635 solved at 1.73 vs 2.52 GFLOP; if the real gain is under 5 points, 8,192 parameters and a
 conditioning path are not worth the complexity, and the ladder should be re-priced honestly at
 `ρ = 0.78` instead.

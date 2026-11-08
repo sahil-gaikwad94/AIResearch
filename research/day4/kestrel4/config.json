@@ -15,6 +15,7 @@
     15
   ],
   "window": 4096,
+  "w_window": 4096,
   "sel_block": 64,
   "sel_topk": 8,
   "anchor_budget": 256,

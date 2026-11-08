@@ -10,7 +10,7 @@ a *structural* reason, not because it needs more parameters or more data.
 ## 10.1 Block-diffusion factor-graph unmasking
 
 **The limit.** Kestrel-4 decodes one token per step, and at batch 1 a step streams 0.84 GB of
-weights to produce 4.68 GFLOP of work — a 26× memory/compute imbalance (§09). Every trick in
+weights to produce 4.37 GFLOP of work — a 28× memory/compute imbalance (§09). Every trick in
 §07 reduces the *number* of steps (0-DoF splicing removes 28 %) but never increases the tokens
 produced per weight stream.
 
@@ -30,13 +30,13 @@ per step is `a(1 − a^B)/(1 − a)`. At `B = 32`:
 
 | `a` | Tokens/step | Step cost (ms) | tok/s | vs 3,984 |
 |---:|---:|---:|---:|---:|
-| 0.60 | 1.5 | 0.55 | 2,730 | 0.69× |
-| 0.70 | 2.3 | 0.55 | 4,240 | 1.06× |
-| 0.90 | 8.7 | 0.55 | 15,800 | 4.0× |
-| 0.97 | 20.1 | 0.55 | 36,400 | 9.1× |
+| 0.60 | 1.5 | 0.53 | 2,830 | 0.71× |
+| 0.70 | 2.3 | 0.53 | 4,400 | 1.10× |
+| 0.90 | 8.7 | 0.53 | 16,400 | 4.1× |
+| 0.97 | 20.1 | 0.53 | 37,900 | 9.5× |
 
-Step cost is `max(weights 0.251 ms, compute 32 × 4.68 GFLOP / 494 TFLOP/s = 0.30 ms) ≈ 0.45–0.55
-ms`. **Break-even is `a ≈ 0.69`**; above 0.90 the win is 4× and above 0.97 it is 9×. The entire
+Step cost is `max(weights 0.251 ms, compute 32 × 4.37 GFLOP / 494 TFLOP/s = 0.283 ms) ≈ 0.45–0.53
+ms`. **Break-even is `a ≈ 0.68`**; above 0.90 the win is 4× and above 0.97 it is 9.5×. The entire
 question is whether a trained model plus a factor graph can commit 90 % of a 32-token block
 soundly, and that is an empirical question worth one 400-GPU-h experiment.
 

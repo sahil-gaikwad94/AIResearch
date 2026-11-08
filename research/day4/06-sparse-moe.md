@@ -55,6 +55,15 @@ and it is why the honest claim is "2× per-token routed width, 8× collective ca
 than the 8× per token that an earlier draft of this design asserted. The distinction matters:
 3,072 is a property of the parameters, 768 is a property of the routing.
 
+**The routing split is a capability knob, not a constant.** At the same six expert evaluations,
+`top-2 groups × top-3` gives 768 routed dimensions, while `top-6 groups × top-1` gives
+**2,304** — three times the per-token width for the same FLOPs — at the cost of choosing 1 of 32
+experts per group instead of 3, i.e. less within-group specialization and a sharper load
+balance problem. The configuration can express both (`top_groups`, `top_k_per_group`), and C2b
+below is the experiment that decides. This is the most promising unexplored corner of the
+architecture: routed rank is free at fixed expert count, and the current 2×3 point was chosen
+for routing entropy, not because 768 is the capacity the task needs.
+
 The two-stage router is also cheaper than a flat one. Scoring 256 experts costs `4096 × 256 =
 1,048,576` MACs per token; scoring 8 groups then 32 experts inside each of 2 groups costs
 `4096 × 8 + 2 × (384 × 32) = 57,344` — **18.3× fewer router MACs**, 0.12 % of the layer's active
@@ -91,3 +100,10 @@ A second, cheaper check runs first: measure the effective rank of the routed out
 ratio of the singular values of the per-token expert-sum matrix) on 10⁴ tokens. If grouped
 routing does not raise it above 384, the subspaces have collapsed and the training recipe needs
 an orthogonality term before C2 is worth its GPU-hours.
+
+**C2b — routing split at fixed evaluations.** Compare `top-2 × top-3` (768 rank) against
+`top-6 × top-1` (2,304 rank) at equal active parameters and equal expert evaluations, 300
+GPU-h. Kill the wide split if it does not beat 2×3 by ≥ 1 point pass@1, or if expert load
+imbalance (max/mean tokens per expert) exceeds 2.0 without auxiliary-loss tuning. A win here is
+worth more than any parameter-count change in this chapter, because it buys capability at zero
+inference cost.

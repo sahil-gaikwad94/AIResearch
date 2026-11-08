@@ -18,6 +18,7 @@ checked to round-trip, so the config file cannot drift from the ledger.
 
 ```bash
 python research/day4/kestrel4/model.py        # 11 assertions — ledger, absorption, routing, jumpback, proof
+python research/day4/tools/audit_v4.py        # 21 adversarial checks: the mechanisms, not the formulas
 python research/day4/tools/count_params_v4.py # params, FLOP/token, GPU-hours, serving bytes
 python research/day4/tools/sim_verify_v4.py   # retry correlation, poison rates, CDCL vs whole-patch retry
 ```
@@ -63,8 +64,9 @@ Per-token active share is 9.75 %, of which 36.5 % is the MoE (6 of 256 experts p
 | 06 | [sparse-moe](06-sparse-moe.md) | Why 8 × 32 with a two-stage router beats 256 flat, and the rank argument |
 | 07 | [reasoning-and-decoding](07-reasoning-and-decoding.md) | CRANE dual mode, 0-DoF splicing, CDCL jumpback: the decode budget |
 | 08 | [safety-and-falsifiers](08-safety-and-falsifiers.md) | Pre-registered C1–C9, failure modes, and what would kill the design |
-| 09 | [training-serving-and-ablations](09-training-serving-and-ablations.md) | 25,067 GPU-hours, 11.69 GB at 4-bit, 33,330 tok/s, and what each ablation costs |
+| 09 | [training-serving-and-ablations](09-training-serving-and-ablations.md) | 23,530 GPU-hours, 11.69 GB at 4-bit, 29,627 tok/s, and what each ablation costs |
 | 10 | [day5-preview](10-day5-preview.md) | Three directions for Kestrel-5 — forecast, labelled |
+| — | [audit_v4.py](tools/audit_v4.py) | 21 checks that try to refute the mechanisms; 13 failed on the first draft |
 
 ## What this is not
 
@@ -73,3 +75,10 @@ an analytic model (`count_params_v4.py`) or a simulation with its assumptions st
 (`sim_verify_v4.py`); §09 lists which numbers are measured, which are modelled, and which are
 forecast. The VEXX 1.5 runtime claims in §04 are the only ones backed by executed tests:
 71 unit tests and 12 soundness tests in Rust, 429 in Python.
+
+The document set was audited against its own reference implementation after it was written.
+`tools/audit_v4.py` refuted **13 of its claims**, including two mechanisms that existed only in
+prose (the memory's sign flip and the indexer's influence on the logits), a 7–12 % cost-model
+over-count, a fudge factor in the retry model, and a certificate that said `verified: True`
+without verifying anything. All thirteen are fixed, and the harness now measures each
+mechanism rather than recomputing the formula it is supposed to check: **21/21 pass**.

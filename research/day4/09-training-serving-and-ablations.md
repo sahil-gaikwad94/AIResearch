@@ -44,6 +44,8 @@ Weight bytes at 4-bit are charged at **0.55 B/param** (weights plus scales and m
 bandwidth at **3.35 TB/s**, and expert residency per layer. Always-on weights (everything except
 routed experts and unselected subspaces) are **0.595 GB**; one expert is **2.60 MB**.
 
+Weights only — §11 corrects this table for KV traffic, and the correction is large.
+
 | Batch | Distinct experts/layer | GB/step | ms/step | tok/s (spliced) | Splice speedup |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 5.9 | 0.84 | 0.251 | 5,080 | 1.28× |
@@ -64,26 +66,21 @@ Stored 11.69 GB at 4-bit, active 1.14 GB per token. At batch 1 the step is 28× 
 (4.37 GFLOP is 8.8 µs of compute against 251 µs of streaming), which is what makes §07's
 block-parallel decode argument plausible and what makes 0-DoF splicing profitable at low batch.
 
-### The byte model does not include KV residency, and at 1 M that is the whole story
+### The byte model omits KV traffic, and that is a 37 % error at batch 64
 
-The table charges expert streaming only. The global NoPE layers must retain every token's
-compressed key to select blocks later, so at 1 M context:
+Two omissions in the table above. First, **residency**: at 1 M the global NoPE layers hold 4.29 GB
+of latents per sequence, 7.3× the always-on weights. Second, and larger in practice, **traffic**:
+the table charges expert streaming only, so it never pays for reading the KV cache. At 4 k and
+batch 64 those reads are 2.55 GB per step against 8.86 GB of weights.
 
-| Cache | Per sequence |
-|---|---:|
-| 12 local layers, 4 k window × 576 floats fp16 | 56.6 MB |
-| 4 global layers, 1 M tokens × 512 floats fp16 | 4.29 GB |
-| **Total** | **4.35 GB** |
+With KV traffic included, sustained decode is 3,801 / 11,747 / **18,784** tok/s at batch 1 / 16 /
+64 — not 5,080 / 17,633 / 29,627. §11 prices the cache, fixes the residency (2.16 GB int8,
+33.6 MB on chip, 1.57 MB paged per step at 1 M) and explains why the local window, not the
+global cache, dominates a 4 k step at high batch.
 
-Against 137 GB for the same 16-layer stack with uncompressed 32 × 128 MHA keys, that is a 31.6×
-compression — but against the 0.595 GB of always-on weights it is 7.3× larger. **At long
-context, Kestrel-4 is memory-bound by global KV residency, not by experts.** The sparse global
-layers make the *compute* constant in context length and leave the *memory* linear; that trade
-is worth stating plainly because it is the first thing a production deployment would hit, and
-because §10 does not solve it.
-
-At batch 64 with a 4 k window instead, KV residency is 64 × 73.4 MB = 4.7 GB, so a real step is
-13.6 GB rather than 8.86 GB and sustained throughput is ≈ 21,800 tok/s rather than 29,627.
+One number from that chapter belongs here: without block sealing, the indexer re-reads 4.29 GB
+of latents per decoded token at 1 M — 1.28 ms against a 251 µs step. The indexer would have cost
+five times the model it indexes, and no FLOP table could see it.
 
 ## 9.3 The ablation programme, priced
 
@@ -141,6 +138,10 @@ harness that measures the mechanism rather than the formula.
 | 23,530 GPU-h | **modelled** at 0.34 MFU, 989 TFLOP/s peak |
 | 0.84 / 3.92 / 8.86 GB per step | **modelled** at 0.55 B/param, 3.35 TB/s |
 | 1.28× / 1.29× / 1.22× splicing speedup | **modelled** with 28 % deterministic steps, 16 µs/token on 4 cores |
+| 2.16 GB int8 KV at 1 M, 33.6 MB on chip | **by construction** (`kv_sizes`, assertion [14]) |
+| int8 latent cosine 0.999952 | **measured** (assertion [12]) |
+| sealed index == dense summary | **measured** (assertion [13], max |Δ| 4.5e-08) |
+| 18,784 tok/s at 4 k/batch 64 | **modelled** at 3.35 TB/s, KV reads included |
 | FPR ladder 0.719 / 0.012 / 0.00216 / 0.000324 | first two **measured**, last two **derived** (`0.012 × 0.18`, `0.012 × 0.027`) |
 | poison 0.049 % at `p_solve = 0.40` | **modelled** from those inputs |
 | retry 1,746 → 52.4 GFLOP | **modelled** as 2.91 GFLOP × tokens re-sampled |

@@ -17,7 +17,7 @@ Everything above is an argument. This chapter is the part that can be wrong in p
 | C9 | Self-training is safe at 40 % solve | poison rate of the stack | > 0.1 % ⇒ no unattended distillation | 180 GPU-h |
 | C10 | Chunked BPTT beats per-step detach | parity / validation loss at equal tokens | < 1 point gain ⇒ detach every step | 60 GPU-h |
 | C11 | The indexer prior is used, not just differentiable | logit sensitivity + ablation loss | no gain ⇒ drop the prior and the indexer path | 40 GPU-h |
-| C12 | A block-summary KV hierarchy preserves recall at 1 M | exact recall, bytes/sequence | < 90 % recall ⇒ keep the 4.29 GB cache | 20 GPU-h |
+| C12 | int8 latents + sealed index + cold tier keep 1 M recall and latency | needle recall, block agreement, step latency | > 0.5 pt recall or > 30 % latency ⇒ drop that arm | 20 GPU-h |
 
 Total cost of the falsification programme ≈ 3,427 GPU-h, 14.6 % of the 23,530 GPU-h budget. That
 is the price of being allowed to say the numbers are real, and it is paid *before* the large

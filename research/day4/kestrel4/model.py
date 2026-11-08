@@ -191,6 +191,149 @@ class GlobalNoPESparseMLA(nn.Module):
         return self.w_o((att @ v).transpose(1, 2).reshape(b, n, h * dh))
 
 
+# --------------------------------------------------------- long-context KV
+#
+# The global NoPE layers cache one 512-float latent per token per layer.  At 1M
+# tokens that is 4.29 GB, 7.3x the always-on weights and 31.6x the same stack
+# with uncompressed MHA keys.  Three mechanisms below attack that number, and
+# `tools/kv_model.py` + audit A10-A13 measure each one rather than restating it.
+
+
+def kv_sizes(c, ctx, bits=8, batch=1, hot_window=None):
+    """Analytic KV bytes under the tiered cache. Single source of truth.
+
+    `tools/kv_model.py`, `tools/count_params_v4.py` and assertion [14] all read
+    this function, so the prose cannot drift from the model.  `bits` is the cold
+    tier's precision; the hot window and the block summaries stay fp16 because
+    they are read every step and are small.
+    """
+    dc, dr = c["d_c"], c["d_rope"]
+    glb, loc = c["global_nope_layers"], c["local_layers"]
+    win = min(ctx, hot_window if hot_window is not None else c["window"])
+    nblocks = math.ceil(ctx / c["sel_block"])
+    read = min(ctx, c["window"] + c["sel_topk"] * c["sel_block"] + c["anchor_budget"])
+    stream = max(0, read - win)
+    local_pt = dc * bits // 8 + dr * 2          # latent at `bits`, rotary key fp16
+    return {
+        "local_hot_bytes": loc * win * local_pt * batch,
+        "global_hot_bytes": glb * win * dc * 2 * batch,
+        "summary_bytes": glb * nblocks * c["idx_dim"] * 2 * batch,
+        "cold_bytes": glb * (ctx - win) * dc * bits // 8 * batch,
+        "cold_bytes_fp16": glb * (ctx - win) * dc * 2 * batch,
+        "stream_bytes": glb * stream * (dc * bits // 8) * batch,
+        "index_bytes_unsealed": glb * ctx * dc * 2 * batch,
+        "read_keys": read,
+    }
+
+
+class LatentQuantizer:
+    """Static per-channel int8 for the global latent KV.
+
+    Keys are quantized per channel, not per token, because latent channels carry
+    outliers (KIVI; KVQuant): one per-token absmax is dominated by a single
+    channel and wastes the 8-bit range.  Scales are calibrated once on 128 k
+    tokens and frozen, so encoding is streaming-safe -- an online per-channel
+    absmax would force re-encoding every time it grew.
+    """
+
+    def __init__(self, bits=8):
+        self.bits = bits
+        self.levels = 2 ** bits - 1        # asymmetric uint codes 0..levels
+
+    def calibrate(self, latents):
+        lo = latents.amin(dim=0)
+        hi = latents.amax(dim=0)
+        scale = (hi - lo).clamp_min(1e-8) / self.levels
+        zero = torch.round(-lo / scale)
+        return scale.float(), zero.float()
+
+    def encode(self, latents, scale, zero):
+        # uint8, not int8: a per-channel asymmetric range needs 2**bits codes,
+        # and clamping 0..254 into int8 saturates half the values (the first
+        # draft did exactly that and scored cosine 0.895 -- audit [12] caught it).
+        q = torch.round(latents / scale + zero).clamp(0, self.levels)
+        return q.to(torch.uint8)
+
+    def decode(self, q, scale, zero):
+        return (q.float() - zero) * scale
+
+
+class SealedBlockIndex(nn.Module):
+    """Block summaries for the indexer, sealed once per 64-token block.
+
+    The training forward recomputes coarse and fine block scores from every
+    cached latent on every call: O(n * d_c) per step.  That is invisible at 4 k
+    and fatal at 1 M, where it re-reads 4.29 GB of latent per decoded token --
+    five times the whole weight stream, i.e. the indexer would cost more than the
+    model it indexes.  Sealing a block when it fills makes the per-step index
+    O(n / bs) instead, which is the cost the documents always claimed.
+    """
+
+    def __init__(self, dc, idx, bs):
+        super().__init__()
+        self.bs, self.dc, self.idx = bs, dc, idx
+        self.register_buffer("sealed", torch.zeros(0, idx))
+        self.register_buffer("sealed_blocks", torch.zeros((), dtype=torch.long))
+
+    def seal(self, block, w_ip, w_ik):
+        pooled = block.mean(dim=0)
+        s = 0.5 * (w_ip(pooled) + w_ik(block).mean(dim=0))
+        self.sealed = torch.cat([self.sealed, s.detach().unsqueeze(0)], dim=0)
+        self.sealed_blocks = self.sealed_blocks + 1
+        return s
+
+    def scores(self, iq):
+        """One dot product per sealed block, never one per latent."""
+        return iq @ self.sealed.T / math.sqrt(self.idx)
+
+    def summaries_read(self):
+        return int(self.sealed_blocks.item())
+
+
+class TieredLatentCache:
+    """Hot window fp16, sealed latents int8 in the cold tier.
+
+    Only `window + topk*bs + anchors` latents are read per query, so the cold
+    tier is paged rather than resident: at 1 M a step streams 1.57 MB instead of
+    holding 4.29 GB on chip.  `bytes_hot`/`bytes_cold` are the numbers assertion
+    [14] checks against `kv_sizes`.
+    """
+
+    def __init__(self, dc, bs=64, window=4096, bits=8):
+        self.dc, self.bs, self.window, self.bits = dc, bs, window, bits
+        self.q = LatentQuantizer(bits)
+        self.scale = self.zero = None
+        self.pages = []
+        self.page_ins = 0
+        self.latents_streamed = 0
+
+    def append(self, ckv):
+        if self.scale is None:
+            self.scale, self.zero = self.q.calibrate(ckv)
+        self.pages.append(self.q.encode(ckv.detach(), self.scale, self.zero))
+
+    def token_count(self):
+        return sum(p.shape[0] for p in self.pages)
+
+    def attach(self):
+        return torch.cat(self.pages, dim=0) if self.pages else torch.zeros(0, self.dc, dtype=torch.int8)
+
+    def gather(self, idx):
+        """Page in the selected latents; count what crossed the bus."""
+        sel = self.attach()[idx]
+        self.page_ins += 1
+        self.latents_streamed += int(sel.shape[0])
+        return self.q.decode(sel, self.scale, self.zero)
+
+    def bytes_hot(self, layers=1, window=None):
+        win = min(self.token_count(), window if window is not None else self.window)
+        return layers * win * self.dc * 2
+
+    def bytes_cold(self, layers=1):
+        win = min(self.token_count(), self.window)
+        return layers * (self.token_count() - win) * self.dc * self.bits // 8
+
+
 def householder_step(state, u, beta):
     """Apply one generalized Householder reflection on the left.
 
@@ -733,6 +876,53 @@ def main():
     assert forged["verified"] is False, "a violating witness was certified"
     print(f"[9] proof   sha256={cert['sha256_witness'][:16]}...  smtlib2_verified=True  ok")
 
+    # [12] Long-context KV: static per-channel int8 on the global latent
+    g = torch.Generator().manual_seed(7)
+    lat = torch.randn(4096, FULL["d_c"], generator=g)
+    lat[:, 3] *= 40.0          # channel outlier, as measured in real key caches
+    lat[:, 17] *= 12.0
+    q8 = LatentQuantizer(8)
+    sc, ze = q8.calibrate(lat)
+    rec = q8.decode(q8.encode(lat, sc, ze), sc, ze)
+    cos8 = float(F.cosine_similarity(lat, rec, dim=-1).mean())
+    rel8 = float((lat - rec).norm() / lat.norm())
+    q4 = LatentQuantizer(4)
+    sc4, ze4 = q4.calibrate(lat)
+    rec4 = q4.decode(q4.encode(lat, sc4, ze4), sc4, ze4)
+    cos4 = float(F.cosine_similarity(lat, rec4, dim=-1).mean())
+    # Contrast: per-token absmax on the same latents, to show the outlier argument
+    s_tok = lat.abs().amax(dim=-1, keepdim=True) / 127.0
+    rec_tok = (torch.round(lat / s_tok).clamp(-127, 127) * s_tok)
+    cos_tok = float(F.cosine_similarity(lat, rec_tok, dim=-1).mean())
+    print(f"[12] kv      int8/channel cos={cos8:.6f} rel={rel8:.2%}  "
+          f"(int4 {cos4:.4f}; int8/token {cos_tok:.4f})  ok")
+    assert cos8 > 0.999
+
+    # [13] Long-context KV: a sealed block is exactly the summary the forward uses
+    sbidx = SealedBlockIndex(tiny["d_c"], tiny["idx_dim"], tiny["sel_block"])
+    ix = torch.randn(4 * tiny["sel_block"], tiny["d_c"])
+    for b0 in range(0, ix.shape[0], tiny["sel_block"]):
+        sbidx.seal(ix[b0:b0 + tiny["sel_block"]], glb_attn.w_ip, glb_attn.w_ik)
+    iq = torch.randn(1, tiny["idx_dim"])
+    sealed = sbidx.scores(iq)
+    pooled = ix.view(4, tiny["sel_block"], -1).mean(dim=1)
+    ref = 0.5 * (glb_attn.w_ip(pooled)
+                 + glb_attn.w_ik(ix).view(4, tiny["sel_block"], -1).mean(dim=1))
+    ref_scores = iq @ ref.T / math.sqrt(tiny["idx_dim"])
+    dmax = float((sealed - ref_scores).abs().max())
+    print(f"[13] index   sealed==recomputed max|dscore|={dmax:.2e}  reads "
+          f"{sbidx.summaries_read()} summaries vs {ix.shape[0]} latents  ok")
+    assert dmax < 1e-5
+
+    # [14] Long-context KV: tiered residency at 1M from the shared analytic model
+    kv = kv_sizes(FULL, 1 << 20, bits=8)
+    hbm = kv["global_hot_bytes"] + kv["summary_bytes"]
+    print(f"[14] residency  1M: hot+summary {hbm/1e6:.1f} MB on chip, cold "
+          f"{kv['cold_bytes']/1e9:.2f} GB int8 (fp16 {kv['cold_bytes_fp16']/1e9:.2f} GB), "
+          f"stream {kv['stream_bytes']/1e6:.2f} MB/step  ok")
+    assert 2.0e9 < kv["cold_bytes"] < 2.3e9
+    assert hbm < 40e6
+
     # [10] End-to-end forward pass + backward pass
     logits, states, p_pass, h, z_loc, z_exec = t(ids, r=3, hyp_idx=2, anchors=torch.tensor([0, 2]))
     (logits.sum() + p_pass.sum() + z_loc.sum() + z_exec.sum()).backward()
@@ -743,7 +933,7 @@ def main():
     st_floats = FULL["r_m"] * FULL["d_m"] * FULL["layers"]
     print(f"[11] state  {st_floats:,} floats = {st_floats * 2 / 1e6:.1f} MB fp16 per session")
     print("=" * 74)
-    print("all 11 Kestrel-4 x VEXX 1.5 assertions passed")
+    print("all 14 Kestrel-4 x VEXX 1.5 assertions passed")
 
 
 if __name__ == "__main__":

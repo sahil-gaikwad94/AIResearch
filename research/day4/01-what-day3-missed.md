@@ -166,10 +166,11 @@ not. Day 4 therefore adds three checks that a formula cannot satisfy:
 ## The second pass: auditing day 4 itself
 
 The rules above were written for days 1–3.1, so the first thing to do with them was point them
-at day 4. `tools/audit_v4.py` is that harness: 21 checks, each of which tries to refute a claim
+at day 4. `tools/audit_v4.py` is that harness: 25 checks, each of which tries to refute a claim
 in these chapters by measuring the mechanism in `kestrel4/model.py`. The first run refuted
-**13 of them**, and two were the same failure class as day 3.1's RoPE — a mechanism that is
-counted, initialized, and inert:
+**13 of its original 21**, and two were the same failure class as day 3.1's RoPE — a mechanism
+that is counted, initialized, and inert. A second pass aimed at the long-context cache (§11)
+refuted three more (A10–A12), including one that made 1 M decode unimplementable:
 
 | # | Claim | Measured | Root cause |
 |---|---|---|---|
@@ -182,6 +183,9 @@ counted, initialized, and inert:
 | A7 | domain cuts keep the domain non-empty | `(0.05, 0.01)` | repeated half-space cuts were never bounded |
 | A8 | the workspace respects its configured window | 0.876 of attention leaked | `4096` hard-coded instead of the config |
 | A9 | per-component parameter counts match | all five match | — (this one held) |
+| A10 | the indexer costs 0.019 GFLOP/token | 4.29 GB re-read per step at 1 M | block summaries were recomputed from every latent, not sealed |
+| A11 | the cache is 4.35 GB at 1 M | true, but only 0.46 % is read | residency was priced as if it were the working set |
+| A12 | per-token int8 is enough for the KV cache | cosine 0.9993 vs 0.99995 per-channel | latent channels carry outliers |
 
 All thirteen are fixed. A1 is now an empirical measurement of the implemented step (`β = 1.8 ⇒
 λ = −0.800`, `β = 2 ⇒ H² = I` to 2.4e-07), A3 uses a real 0.1 logit prior instead of a fake

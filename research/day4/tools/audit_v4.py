@@ -22,11 +22,15 @@ from kestrel4.model import (  # noqa: E402
     CodeJEPAWorkspace,
     HouseholderDeltaProductMemory,
     Kestrel4,
+    LatentQuantizer,
+    SealedBlockIndex,
     SubspaceLatentMoE,
+    TieredLatentCache,
     VexxNeuroSymbolicController,
     attn_global_nope_params,
     attn_local_params,
     householder_step,
+    kv_sizes,
     mem_params,
     moe_params,
     workspace_params,
@@ -234,6 +238,92 @@ def audit_params():
           f"{workspace_params(TINY)} vs {ws}")
 
 
+def audit_kv_bytes():
+    section("A10 KV bytes: does the analytic model match an independent count?")
+    import kestrel4.model as m
+
+    V = m.FULL
+    for ctx in (4096, 1 << 20):
+        s = kv_sizes(V, ctx, bits=8)
+        win = min(ctx, V["window"])
+        local = V["local_layers"] * win * (V["d_c"] + 2 * V["d_rope"])
+        cold = V["global_nope_layers"] * (ctx - win) * V["d_c"]
+        summ = V["global_nope_layers"] * math.ceil(ctx / V["sel_block"]) * V["idx_dim"] * 2
+        ok = (s["local_hot_bytes"] == local and s["cold_bytes"] == cold
+              and s["summary_bytes"] == summ)
+        check(f"ctx={ctx} KV bytes equal elementwise construction", ok,
+              f"local={s['local_hot_bytes']:,} cold={s['cold_bytes']:,} summaries={s['summary_bytes']:,}")
+
+
+def audit_index_seal():
+    section("A11 Sealed index: exact summary, sublinear reads")
+    import kestrel4.model as m
+
+    V = m.FULL
+    attn = m.GlobalNoPESparseMLA(TINY)
+    n, bs = 4096, TINY["sel_block"]
+    lat = torch.randn(n, TINY["d_c"])
+    idx = SealedBlockIndex(TINY["d_c"], TINY["idx_dim"], bs)
+    for b0 in range(0, n, bs):
+        idx.seal(lat[b0:b0 + bs], attn.w_ip, attn.w_ik)
+    iq = torch.randn(3, TINY["idx_dim"])
+    sealed = idx.scores(iq)
+    pooled = lat.view(n // bs, bs, -1).mean(dim=1)
+    ref = 0.5 * (attn.w_ip(pooled)
+                 + attn.w_ik(lat).view(n // bs, bs, -1).mean(dim=1))
+    ref_scores = iq @ ref.T / math.sqrt(TINY["idx_dim"])
+    dmax = float((sealed - ref_scores).abs().max())
+    reads = idx.summaries_read()
+    check("sealed summaries equal dense recomputation", dmax < 1e-6,
+          f"max|dscore|={dmax:.2e} over {n} latents")
+    check("index reads are one summary per block", reads == n // bs,
+          f"{reads} rows read vs {n} latents ({reads / n:.2%})")
+
+
+def audit_kv_precision():
+    section("A12 KV precision: per-channel int8 survives outliers")
+    g = torch.Generator().manual_seed(11)
+    lat = torch.randn(2048, 256, generator=g)
+    lat[:, 5] *= 25.0
+    lat[:, 9] *= 8.0
+    lat[:, 40] *= 3.0
+    q8 = LatentQuantizer(8)
+    s, z = q8.calibrate(lat)
+    rec = q8.decode(q8.encode(lat, s, z), s, z)
+    cos8 = float(torch.nn.functional.cosine_similarity(lat, rec, dim=-1).mean())
+    s_tok = lat.abs().amax(dim=-1, keepdim=True) / 127.0
+    rec_tok = torch.round(lat / s_tok).clamp(-127, 127) * s_tok
+    cos_tok = float(torch.nn.functional.cosine_similarity(lat, rec_tok, dim=-1).mean())
+    check("int8 per-channel cosine > 0.999", cos8 > 0.999, f"cos={cos8:.6f}")
+    check("per-channel beats per-token under outliers", cos8 > cos_tok,
+          f"per-channel {cos8:.6f} vs per-token {cos_tok:.6f}")
+
+
+def audit_kv_tier():
+    section("A13 Tiered cache: accounting matches, only selected latents stream")
+    cache = TieredLatentCache(dc=64, bs=4, window=8, bits=8)
+    cache.append(torch.randn(4, 64))
+    cache.append(torch.randn(4, 64))
+    cache.append(torch.randn(4, 64))
+    picks = torch.tensor([0, 2, 5, 9, 11])
+    out = cache.gather(picks)
+    check("gather returns the selected rows", out.shape == (5, 64),
+          f"shape={tuple(out.shape)} streamed={cache.latents_streamed} latents")
+    check("only selected latents cross the bus", cache.latents_streamed == 5,
+          f"{cache.latents_streamed} of {cache.token_count()} latents")
+    check("cold bytes count only the un-windowed tail",
+          cache.bytes_cold(layers=1) == (12 - 8) * 64,
+          f"cold={cache.bytes_cold(layers=1)} B expected={(12 - 8) * 64} B")
+    import kestrel4.model as m
+
+    s = kv_sizes(m.FULL, 1 << 20, bits=8)
+    expected = m.FULL["global_nope_layers"] * (
+        m.FULL["sel_topk"] * m.FULL["sel_block"] + m.FULL["anchor_budget"]) * m.FULL["d_c"]
+    check("1M stream per step is the selected non-window latents",
+          s["stream_bytes"] == expected,
+          f"stream={s['stream_bytes']:,} B ({s['stream_bytes'] / 1e6:.2f} MB)")
+
+
 def main():
     print("=" * 78)
     print("DAY 4 ADVERSARIAL AUDIT")
@@ -247,6 +337,10 @@ def main():
     audit_domain()
     audit_workspace()
     audit_params()
+    audit_kv_bytes()
+    audit_index_seal()
+    audit_kv_precision()
+    audit_kv_tier()
     failed = [name for name, ok, _ in RESULTS if not ok]
     print("\n" + "=" * 78)
     print(f"{len(RESULTS) - len(failed)}/{len(RESULTS)} claims hold; "

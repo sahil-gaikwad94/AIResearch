@@ -65,10 +65,11 @@ false accepts, which turns self-training at a 40 % solve rate from a 1.8 % poiso
 one, and turns a failed 600-token patch from 1,746 GFLOP into **52.4 GFLOP**.
 
 **21,248,719,490 parameters stored, 2,071,178,882 read per token (9.75 %), 23,530 GPU-hours,
-11.69 GB at 4-bit, 29,627 tok/s with splicing.** Eleven assertions in `kestrel4/model.py`, all
-passing; the config is generated from the reference implementation so the ledger cannot drift,
-and `tools/audit_v4.py` tries to refute each mechanism in the prose (13 claims failed the
-first audit; all are fixed, 21/21 pass).
+11.69 GB at 4-bit, 18,784 tok/s at 4 k/batch 64 with KV traffic, 2.16 GB int8 KV per 1 M session
+(33.6 MB on chip).** Fourteen assertions in `kestrel4/model.py`, all passing; the config is
+generated from the reference implementation so the ledger cannot drift, and `tools/audit_v4.py`
+tries to refute each mechanism in the prose (16 claims failed across two audits; all are fixed,
+31/31 pass).
 
 Start with [`day4/01-what-day3-missed.md`](day4/01-what-day3-missed.md), which is an audit
 written after the fixes, or [`day4/04-verification.md`](day4/04-verification.md), which is the

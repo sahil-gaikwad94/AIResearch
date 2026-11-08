@@ -124,7 +124,8 @@ projected away and the direction is not viable.
 
 ## 10.4 What this preview does not solve
 
-The finding in §09.2 — **4.35 GB of KV at 1 M, 7.3× the always-on weights** — is not addressed by
+The finding in §11 — **4.35 GB of KV at 1 M, 7.3× the always-on weights**, cut to 2.16 GB int8 with
+33.6 MB on chip — is not addressed by
 any of the three directions. Sparse global attention makes compute constant in context and
 leaves residency linear. A fourth direction exists (hierarchical summarization of global blocks
 into a second-level index, so blocks can be evicted), but it is not designed here, and it is the

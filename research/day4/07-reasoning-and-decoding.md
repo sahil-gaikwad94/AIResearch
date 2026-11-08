@@ -15,10 +15,15 @@ decomposition by `tools/audit_v4.py`:
 | 4 | 5.29 | 5.35 | 5.36 |
 | 8 | 6.52 | 6.58 | 6.59 |
 
-Two things to read from this table. First, **context is nearly free**: going from 4 k to 1 M
-adds 0.07 GFLOP/token (1.6 %), because the local layers are windowed and the global layers
+Two things to read from this table. First, **context is nearly free in FLOPs**: going from 4 k to
+1 M adds 0.07 GFLOP/token (1.6 %), because the local layers are windowed and the global layers
 read 4,864 selected keys regardless of length. Second, **depth is not**: `r = 8` costs 49 %
 more than `r = 1`. The recurrent dial is the expensive axis, which is why it is a dial.
+
+The FLOP table is not a byte table. Context is free in arithmetic and expensive in memory: at
+4 k and batch 64 the KV *reads* are 2.55 GB per step against 8.86 GB of weights, and §11 shows
+that adding them takes sustained decode from 29,627 to 18,784 tok/s. Read this chapter as the
+compute budget and §11 as the memory budget.
 
 The workspace accounts for most of that slope: one extra iteration costs **0.307 GFLOP/token**
 (`r = 2` minus `r = 1`), and 7 extra iterations cost 2.15 GFLOP — the 4.37 → 6.52 difference. A

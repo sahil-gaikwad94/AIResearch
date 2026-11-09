@@ -6,4 +6,4 @@ prints anything and never runs the 15 self-assertions (they live under
 """
 
 from .model import *  # noqa: F401,F403 re-export the model namespace
-from .model import (FULL, KESTREL5_NANO_165M, Kestrel5, tiny_config)
+from .model import (FULL, KESTREL5_NANO_151M, Kestrel5, tiny_config)

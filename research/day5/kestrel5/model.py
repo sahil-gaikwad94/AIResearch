@@ -1,8 +1,9 @@
-```python
 #!/usr/bin/env python3
-"""Kestrel-5.1 x VEXX 2.1 (Day 6 Patched Reference Implementation).
+"""Kestrel-5.1 x VEXX 2.1 (Day 5 reference implementation, hygiene-fixed).
 
-Fixes all seven architectural and neuro-symbolic defects identified in the
+Day 5 is a research architecture / neuro-symbolic mechanism prototype. It is
+NOT a trained language model: there is no checkpoint, no autograd graph, no
+tokenizer, and no generation API. These flags are therefore truthful.
 Day 5 adversarial audit:
   1. Gauge-Covariant & Anchor-Consolidated WY Householder Memory:
      - Semi-orthogonal Stiefel initialization of A (uniform unit singular values)
@@ -83,7 +84,7 @@ FULL = dict(
     rope_theta=500000.0,
 )
 
-KESTREL5_NANO_165M = dict(
+KESTREL5_NANO_151M = dict(
     vocab=32768,
     d=768,
     heads=12,
@@ -686,12 +687,17 @@ class SubspaceLatentMoE:
         tg = self.top_g if top_groups is None else top_groups
         return tg * self.d_lat * self._rank_scale
 
-    def orthogonality_loss(self):
-        self.retract_stiefel_subspaces()
+    def orthogonality_error(self):
+        """Non-mutating measurement of Stiefel orthogonality error.
+
+        Does NOT retract or modify any weights. Returns the Frobenius norm of
+        (U U^T - I) so it can be recorded before and after an optimizer update.
+        """
         U = np.concatenate(self.up_groups, axis=0)
         gram = U @ U.T
         off = gram - np.eye(gram.shape[0])
         return float(np.sum(off * off))
+
 
     def update_load_balance_biases(self, group_loads, expert_loads, lr=1e-3):
         mean_g = np.mean(group_loads)
@@ -886,10 +892,22 @@ class Block:
 
 
 class Kestrel5:
-    """Kestrel-5.1 x VEXX 2.1 Patched Model with Neural MTP Draft Heads & Training Step."""
+    """Kestrel-5.1 x VEXX 2.1 reference model (NumPy, no autograd).
 
-    has_trained_checkpoint = True
-    supports_backward_and_muon = True
+    Randomly-initialized reference. Truthful metadata:
+      model_status    = "randomly_initialized_reference"
+      training_backend = "numpy_reference_only"
+      checkpoint_loaded = False
+      supports_autograd  = False
+    Set checkpoint_loaded=True only after a real checkpoint is loaded and
+    validated against a config hash. Only advertise an optimizer after a real
+    optimizer update has been tested.
+    """
+
+    model_status = "randomly_initialized_reference"
+    training_backend = "numpy_reference_only"
+    checkpoint_loaded = False
+    supports_autograd = False
 
     def __init__(self, c=FULL, seed=42):
         self.c = c
@@ -899,11 +917,6 @@ class Kestrel5:
         self.blocks = [Block(c, rng, is_global_nope=(i in global_set)) for i in range(c["layers"])]
         self.norm = np.ones(c["d"])
         self.workspace = CodeJEPAWorkspace(c, rng)
-        # Neural MTP speculative draft heads (depth = mtp_spec_depth)
-        self.mtp_heads = [
-            rng.standard_normal((c["d"], c["d"])) / math.sqrt(c["d"])
-            for _ in range(c.get("mtp_spec_depth", 3))
-        ]
 
     def forward(self, ids, r=2, hyp_idx=0, anchors=None, states=None):
         x = self.embed[ids]
@@ -914,25 +927,7 @@ class Kestrel5:
             new_states.append(s)
         x_ws, h, p_pass, z_loc, z_exec = self.workspace.forward(x, r=r, hyp_idx=hyp_idx)
         logits = rms_norm(x_ws, self.norm) @ self.embed.T
-        if ids.shape[1] >= 16 and r >= 8:
-            # At deep recurrence r=8 on long reasoning chains, workspace confidence refines top-2 ties
-            sorted_idx = np.argsort(-logits, axis=-1)
-            top1 = sorted_idx[..., 0]
-            top2 = sorted_idx[..., 1]
-            margin = np.take_along_axis(logits, top1[..., None], axis=-1).squeeze(-1) - np.take_along_axis(logits, top2[..., None], axis=-1).squeeze(-1)
-            tie_pos = np.argsort(margin, axis=-1)[..., :2]
-            for bi in range(ids.shape[0]):
-                for pos_i in tie_pos[bi]:
-                    t1, t2 = top1[bi, pos_i], top2[bi, pos_i]
-                    logits[bi, pos_i, t2] = logits[bi, pos_i, t1] + 1e-4
         return logits, new_states, p_pass, h, z_loc, z_exec
-
-    def training_step_muon_stiefel(self, ids, lr=1e-3):
-        """Executes a forward + backward + Muon/Stiefel-retracted parameter update step."""
-        logits, states, p_pass, h, z_loc, z_exec = self.forward(ids, r=2)
-        for blk in self.blocks:
-            blk.moe.retract_stiefel_subspaces()
-        return float(np.mean(logits ** 2))
 
 
 # ---------------------------------------------------------- VEXX 2.1 controller
@@ -1707,8 +1702,8 @@ def main():
 
     smoe = tm.blocks[0].moe
     U = np.concatenate(smoe.up_groups, axis=0)
-    assert smoe.orthogonality_loss() < 1e-24 and np.linalg.matrix_rank(U) == c["n_groups"] * c["d_lat"]
-    print(f"[8] Stiefel MoE orth_loss={smoe.orthogonality_loss():.2e}, rank={np.linalg.matrix_rank(U)}/64")
+    assert smoe.orthogonality_error() < 1e-24 and np.linalg.matrix_rank(U) == c["n_groups"] * c["d_lat"]
+    print(f"[8] Stiefel MoE orth_loss={smoe.orthogonality_error():.2e}, rank={np.linalg.matrix_rank(U)}/64")
 
     assert smoe.routed_rank(6) == 3 * smoe.routed_rank(2)
     print(f"[9] Routed rank: 6x1={smoe.routed_rank(6)} == 3 * 2x3={smoe.routed_rank(2)}")
@@ -1793,12 +1788,12 @@ def main():
     for _ in range(10):
         grads = [np.random.default_rng(77).standard_normal(u.shape) * 0.05 for u in smoe_st.up_groups]
         smoe_st.apply_stiefel_gradients(grads, lr=1.0)
-    assert smoe_st.orthogonality_loss() < 1e-24
+    assert smoe_st.orthogonality_error() < 1e-24
     y_pre = smoe_st.forward(x_u, top_groups=6, top_k_per_group=1)
     smoe_st.upcycle_experts_zero_shock(2, 0.1, np.random.default_rng(101))
     y_post_k6 = smoe_st.forward(x_u, top_groups=6, top_k_per_group=1)
     assert np.max(np.abs(y_pre - y_post_k6)) < 1e-12
-    print(f"[18] Stiefel retraction orth_loss={smoe_st.orthogonality_loss():.2e}, k=6 upcycle diff={np.max(np.abs(y_pre - y_post_k6)):.2e}")
+    print(f"[18] Stiefel retraction orth_loss={smoe_st.orthogonality_error():.2e}, k=6 upcycle diff={np.max(np.abs(y_pre - y_post_k6)):.2e}")
 
     # [19] Un-gated workspace r=8 token refinement, z_exec evolution & token-level p_pass
     ids16 = np.random.default_rng(101).integers(0, c["vocab"], size=(1, 16))
@@ -1863,4 +1858,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```

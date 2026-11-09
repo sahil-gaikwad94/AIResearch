@@ -20,7 +20,7 @@ k5 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(k5)
 
 FULL = k5.FULL
-NANO = k5.KESTREL5_NANO_165M
+NANO = k5.KESTREL5_NANO_151M
 
 
 # --------------------------------------------------------------------- ledger
@@ -284,7 +284,7 @@ def main():
           delta == 4 * (2 * d * dl + dl * eg + eg),
           f"delta={delta:,} = 4 x {2 * d * dl + dl * eg + eg:,}")
 
-    print("\nB. KESTREL5_NANO_165M (free Kaggle 2xT4 / Colab 1xT4 tier)")
+    print("\nB. KESTREL5_NANO_151M (free Kaggle 2xT4 / Colab 1xT4 tier)")
     n_tot = k5.total_params(NANO)
     n_act = k5.active_params(NANO, 6)
     check("NANO total == 151,495,922", n_tot == 151_495_922, f"{n_tot:,}")
@@ -351,7 +351,7 @@ def main():
           serving_model(FULL, "h200_8x_fp8")["implied_mbu"] < 1.0,
           "it is quoted as a target at a stated MBU, see doc 09")
 
-    print("\nF. KESTREL5_NANO_165M training budget (batch 16 x 2048, r=2)")
+    print("\nF. KESTREL5_NANO_151M training budget (batch 16 x 2048, r=2)")
     b = training_budget(NANO)
     print(f"  weights fp16        {b['weights_mb']:8.1f} MB")
     print(f"  fp32 master copy    {b['master_mb']:8.1f} MB")

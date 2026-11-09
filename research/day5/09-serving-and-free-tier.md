@@ -22,7 +22,7 @@ a requirement of hitting 12,216 tok/s, not an optimisation. And 12,216 remains
 a **target** — at 74.9% MBU it is plausible and unproven, and every place this
 directory quotes it, it is quoted as a target.
 
-## KESTREL5_NANO_165M (free tier)
+## KESTREL5_NANO_151M (free tier)
 
 | | |
 |---|---|
@@ -32,7 +32,9 @@ directory quotes it, it is quoted as a target.
 
 The full-model ledger shape scaled down: 12 local + 3 global layers
 (`global_layer_indices = (3, 6, 9, 11)`), d 768, and the same subsystems. It is
-deliberately a *true* 165M-tier model, not a FULL with the numbers moved.
+deliberately a *true* ~151M-tier model, not a FULL with the numbers moved. The
+name was reconciled with the stored count (the config key `KESTREL5_NANO_165M`
+was a misnomer; there is no convention under which this config yields 165M).
 
 ## Training budget on one 16 GB T4 (batch 16 × 2,048, r = 2)
 

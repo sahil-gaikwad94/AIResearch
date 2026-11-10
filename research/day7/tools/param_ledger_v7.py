@@ -29,6 +29,7 @@ from kestrel7.model import (  # noqa: E402
     count_params,
     gdn_state_bytes,
     kv_cache_bytes,
+    parameter_ledger,
 )
 from eval_tempbench_v7 import run_benchmark  # noqa: E402
 
@@ -46,6 +47,7 @@ def ledger() -> dict:
         kv_fp16 = kv_cache_bytes(model, dtype_bytes=2)
         all_full = n_full + n_gdn  # counterfactual: every layer is full attention
         kv_all_full = all_full * 2 * cfg["n_kv_heads"] * (cfg["d"] // cfg["n_heads"]) * cfg["max_ctx"] * 2
+        detailed = parameter_ledger(model)
         presets[name] = {
             "total_params": total,
             "total_params_pretty": f"{total:,}",
@@ -63,7 +65,21 @@ def ledger() -> dict:
                 100.0 * (1.0 - kv_fp16 / max(1, kv_all_full)), 2
             ),
             "gdn_state_bytes_fp32_batch1": gdn_state_bytes(model, batch=1),
+            # P1.4.9: detailed per-module and per-layer breakdown.
+            "embedding_params": detailed["embedding_params"],
+            "head_params": detailed["head_params"],
+            "tied_embeddings": detailed["tied_embeddings"],
+            "kv_cache_per_layer_fp16": detailed["kv_cache_per_layer_fp16"],
+            "gdn_state_per_layer_fp32_batch1": detailed["gdn_state_per_layer_fp32_batch1"],
+            "activation_estimate_bytes": detailed["activation_estimate_bytes"],
         }
+        # P1.4.9: label the KV reduction as counterfactual arithmetic, not a
+        # measured end-to-end reduction.
+        presets[name]["kv_reduction_note"] = (
+            "Counterfactual arithmetic: 3 of every 4 layers keep an O(1) state "
+            "instead of a per-token KV cache. Not a measured end-to-end memory "
+            "or latency reduction."
+        )
         del model
 
     bench = run_benchmark(verbose=False)

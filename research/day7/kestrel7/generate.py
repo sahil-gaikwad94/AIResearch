@@ -95,6 +95,7 @@ def generate_v7(
     seed: Optional[int] = None,
     mode: str = PLAIN,
     provenance: Optional[List[str]] = None,
+    context_mode: str = "rolling_window",
 ) -> str:
     """Generate a continuation, optionally with VEXX Tier 0/1/2 masking.
 
@@ -108,26 +109,49 @@ def generate_v7(
     syntax/symbol-table mask; ``plain`` applies only the control-token policy,
     so prose containing parentheses, dotted names or mathematical notation is
     never corrupted.
+
+    P1.4.7: ``context_mode`` controls behavior when the prompt exceeds
+    ``max_ctx``:
+    * ``rolling_window`` (default): truncate the prompt to ``max_ctx`` and
+      continue generation with the cached window; truncation is recorded.
+    * ``strict``: return early with a structured ``context_limit_reached``
+      result instead of silently truncating.
     """
     if mode not in VALID_MODES:
         raise ValueError(f"unknown decoding mode {mode!r}; valid: {sorted(VALID_MODES)}")
+    if context_mode not in {"rolling_window", "strict"}:
+        raise ValueError(
+            f"unknown context_mode {context_mode!r}; valid: rolling_window, strict"
+        )
     model.eval()
     origins: List[str] = ["neural_generation"]
 
     ids = tokenizer.encode(prompt, add_bos=add_bos, add_eos=False)
     if len(ids) == 0:
         ids = [tokenizer.token_to_id[BOS]]
-    # Prefill truncates to the context window. Track the *truncated* length:
-    # using the original prompt length as seq_start would place RoPE positions
-    # beyond the cached keys and corrupt every later decode step.
+    # Truncate to max_ctx before prefill so mock models (and the real model's
+    # truncation_info) agree on the effective context length.
     truncated = False
     if len(ids) > model.max_ctx:
         ids = ids[-model.max_ctx :]
         truncated = True
     input_ids = torch.tensor([ids], dtype=torch.long)
 
-    logits, cache = model.prefill(input_ids)
-    seq_start = int(input_ids.shape[1])
+    # P1.4.7: prefill reports truncation explicitly; no silent long-context claim.
+    logits, cache, truncation_info = model.prefill(input_ids)
+    seq_start = int(input_ids.shape[1]) - truncation_info["tokens_dropped"]
+
+    if context_mode == "strict" and truncation_info["truncated"]:
+        provenance_note = (
+            f"context_limit_reached: prompt truncated from "
+            f"{seq_start + truncation_info['tokens_dropped']} to {seq_start} tokens"
+        )
+        if provenance is not None:
+            provenance.extend(origins + ["context_limit_reached"])
+        return prompt + "\n[CONTEXT_LIMIT_REACHED] " + provenance_note
+
+    if truncation_info["truncated"]:
+        origins.append("prompt_truncated")
     generated: List[int] = []
     eos_id = tokenizer.token_to_id.get(EOS)
 
@@ -195,7 +219,7 @@ def generate_v7(
         seq_start += 1
 
     result = prompt + tokenizer.decode(generated)
-    if truncated:
+    if truncation_info["truncated"]:
         origins.append("prompt_truncated")
     if provenance is not None:
         provenance.extend(origins)

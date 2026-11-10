@@ -214,7 +214,7 @@ def test_block_diagonal_document_mask(dense, hybrid):
 def test_hybrid_streaming_cache_equivalence(hybrid):
     seq = torch.randint(0, hybrid.vocab, (1, 6))
     full, _ = hybrid(seq)
-    prefill_logits, cache = hybrid.prefill(seq[:, :3])
+    prefill_logits, cache, _ = hybrid.prefill(seq[:, :3])
     steps = [prefill_logits]
     for pos in range(3, 6):
         step_logits, cache = hybrid.decode_step(seq[:, pos : pos + 1], cache, seq_start=pos)
@@ -396,7 +396,7 @@ def test_tier2_crane_cas(vx):
 
 def test_tier3_farkas_cut_and_hybrid_rewind(hybrid, vx):
     seq = torch.randint(0, hybrid.vocab, (1, 6))
-    _, cache = hybrid.prefill(seq)
+    _, cache, _ = hybrid.prefill(seq)
     vx.save_checkpoint("w1", 2, cache, entropy=2.5, proposed_val=50.0)
     vx.save_checkpoint("w2", 5, cache, entropy=0.4, proposed_val=80.0)
     tok_idx, rewound, bounds = vx.trigger_farkas_cdcl_jumpback(
@@ -412,7 +412,7 @@ def test_tier3_farkas_cut_and_hybrid_rewind(hybrid, vx):
 
     # Negative coefficient yields a lower bound, not an upper bound.
     vx2 = Vexx3Controller(domain_bounds={"w1": (0.0, 100.0), "w2": (0.0, 100.0)})
-    _, cache2 = hybrid.prefill(seq)
+    _, cache2, _ = hybrid.prefill(seq)
     vx2.save_checkpoint("w1", 1, cache2, entropy=1.0, proposed_val=50.0)
     _, _, b2 = vx2.trigger_farkas_cdcl_jumpback(
         {"w1"}, {"coeffs": {"w1": -2}, "rhs": -50}, {"w1": 50.0}
@@ -604,7 +604,7 @@ def test_sliding_window_prefill_and_streaming_are_finite():
     with torch.no_grad():
         full, _ = model(seq)
         assert torch.isfinite(full).all(), "sliding-window prefill produced NaN"
-        _, cache = model.prefill(seq[:, :6])
+        _, cache, _ = model.prefill(seq[:, :6])
         outs = []
         for pos in range(6, 10):
             step, cache = model.decode_step(seq[:, pos : pos + 1], cache, pos)
@@ -723,7 +723,7 @@ class _RecordingModel:
         self.prefill_len = int(input_ids.shape[1])
         logits = torch.full((1, self.vocab), -10.0)
         logits[0, self.forced_id] = 10.0
-        return logits, [{"fake": torch.zeros(1)}]
+        return logits, [{"fake": torch.zeros(1)}], {"truncated": False, "tokens_dropped": 0, "max_ctx": self.max_ctx}
 
     def decode_step(self, token_ids, cache, seq_start):
         self.calls.append(int(token_ids[0, 0]))
@@ -1079,7 +1079,7 @@ def test_generate_always_invokes_model_prefill(tok):
             self.prefill_calls += 1
             logits = torch.full((1, self.vocab), -10.0)
             logits[0, self.forced_id] = 10.0
-            return logits, [{"fake": torch.zeros(1)}]
+            return logits, [{"fake": torch.zeros(1)}], {"truncated": False, "tokens_dropped": 0, "max_ctx": self.max_ctx}
 
         def decode_step(self, token_ids, cache, seq_start):
             self.decode_calls += 1

@@ -229,7 +229,7 @@ class BPETokenizer:
             ids.append(self.token_to_id[EOS])
         return ids
 
-    def decode(self, ids: List[int]) -> str:
+    def decode(self, ids: List[int], preserve_protocol: bool = False) -> str:
         unknown = [int(tid) for tid in ids if int(tid) not in self.id_to_token]
         if unknown:
             raise ValueError(
@@ -237,12 +237,60 @@ class BPETokenizer:
                 "the vocabulary and checkpoint do not match"
             )
         chunks = [self.id_to_token[int(tid)] for tid in ids]
-        chunks = [c for c in chunks if c not in self.special_tokens]
+        if preserve_protocol:
+            # Keep protocol markers (think_start/think_end) so the controller
+            # can track the CRANE phase from generated token IDs.
+            chunks = [c for c in chunks if c not in self.special_tokens or c in (THINK_START, THINK_END)]
+        else:
+            chunks = [c for c in chunks if c not in self.special_tokens]
         raw = "".join(chunks)
         try:
             return raw.encode("latin-1").decode("utf-8")
         except UnicodeDecodeError:
             return raw
+
+    def validate(self) -> None:
+        """P1.4.8: explicitly validate every tokenizer invariant.
+
+        Raises ValueError if any invariant is violated (fail-closed).
+        """
+        # Token IDs must be unique, dense and contiguous from zero.
+        ids = list(self.id_to_token.keys())
+        if ids != list(range(len(ids))):
+            raise ValueError(f"token IDs are not dense/contiguous from zero: {ids[:5]}...")
+        # vocab_size must equal number of IDs and max_id + 1.
+        if self.vocab_size != len(self.token_to_id):
+            raise ValueError(
+                f"vocab_size {self.vocab_size} != len(token_to_id) {len(self.token_to_id)}"
+            )
+        if self.vocab_size != max(ids) + 1 if ids else self.vocab_size != 0:
+            raise ValueError(
+                f"vocab_size {self.vocab_size} != max_id + 1 {max(ids) + 1 if ids else 0}"
+            )
+        # Every merge operand and result must exist in the declared vocabulary.
+        for a, b in self.merges:
+            if a not in self.token_to_id:
+                raise ValueError(f"merge operand {a!r} not in vocabulary")
+            if b not in self.token_to_id:
+                raise ValueError(f"merge operand {b!r} not in vocabulary")
+            merged = a + b
+            if merged not in self.token_to_id:
+                raise ValueError(f"merge result {merged!r} not in vocabulary")
+        # All special token names and IDs must be unique.
+        if len(self.special_tokens) != len(set(self.special_tokens)):
+            raise ValueError("special token names are not unique")
+        special_ids = [self.token_to_id[st] for st in self.special_tokens]
+        if len(special_ids) != len(set(special_ids)):
+            raise ValueError("special token IDs are not unique")
+        # Merge order must be deterministic: merge_rank must match merges order.
+        for rank, (a, b) in enumerate(self.merges):
+            la = self.token_to_id.get(a)
+            rb = self.token_to_id.get(b)
+            if la is not None and rb is not None:
+                if self.merge_rank.get((la, rb)) != rank:
+                    raise ValueError(
+                        f"merge_rank mismatch at rank {rank} for ({a!r}, {b!r})"
+                    )
 
     # ------------------------------------------------------------------ persistence
 

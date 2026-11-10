@@ -18,6 +18,7 @@ only change after every load step has succeeded.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 
@@ -27,6 +28,15 @@ import torch
 from .model import Kestrel7, hash_config
 
 VERSION = 7
+
+
+def _artifact_id(path: str) -> str:
+    """Stable content identifier for a checkpoint file (sha256 of the bytes)."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
 
 
 def capture_rng_state() -> dict:
@@ -62,8 +72,14 @@ def save_checkpoint_v7(
     scheduler,
     trainer_state: dict,
     path: str,
+    extra: Optional[dict] = None,
 ) -> None:
-    """Persist model, optimizer, scheduler, trainer and RNG state plus hashes."""
+    """Persist model, optimizer, scheduler, trainer and RNG state plus hashes.
+
+    ``extra`` carries best-checkpoint metadata (P0.3) without polluting the
+    resumable trainer state: a ``best`` checkpoint stores the metric that made
+    it best and the step/token count at which it was saved.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = {
         "version": VERSION,
@@ -71,6 +87,13 @@ def save_checkpoint_v7(
         "config_hash": hash_config(model.config),
         "tokenizer_hash": model.tokenizer_hash,
         "model_status": model.model_status,
+        "weights_origin": getattr(model, "weights_origin", "random_init"),
+        "optimizer_updates": int(getattr(model, "optimizer_updates", 0)),
+        "tokens_seen": int(getattr(model, "tokens_seen", 0)),
+        "checkpoint_artifact_id": getattr(model, "checkpoint_artifact_id", None),
+        "capability_evaluation_status": getattr(
+            model, "capability_evaluation_status", "not_evaluated"
+        ),
         "trainer_state": trainer_state,
         "rng": capture_rng_state(),
         "model": model.state_dict(),
@@ -82,7 +105,13 @@ def save_checkpoint_v7(
         if scheduler is not None
         else None,
     }
-    torch.save(payload, path)
+    if extra:
+        payload["extra"] = dict(extra)
+    # Atomic write: a crash mid-write can never leave a valid checkpoint
+    # behind under the final name.
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
 
 
 def load_checkpoint_v7(
@@ -155,7 +184,30 @@ def load_checkpoint_v7(
     if restore_rng:
         restore_rng_state(payload.get("rng") or {})
 
-    # Truthful metadata only after every check and restoration succeeded.
+    # Truthful metadata only after every check and restoration succeeded. The
+    # origin/update/capability fields are restored verbatim from the artifact
+    # that was saved; they are never inferred from one another.
     model.checkpoint_loaded = True
     model.model_status = "trained_checkpoint_loaded"
+    if "weights_origin" in payload:
+        model.weights_origin = payload["weights_origin"]
+    if "optimizer_updates" in payload:
+        model.optimizer_updates = int(payload["optimizer_updates"])
+    if "tokens_seen" in payload:
+        model.tokens_seen = int(payload["tokens_seen"])
+    if "capability_evaluation_status" in payload:
+        model.capability_evaluation_status = payload["capability_evaluation_status"]
+    artifact = payload.get("checkpoint_artifact_id")
+    if artifact is None:
+        artifact = _artifact_id(path)
+    model.checkpoint_artifact_id = artifact
+    # Best-checkpoint metadata (P0.3), if this artifact was saved as a "best"
+    # snapshot, is surfaced under "best" so callers can distinguish it from
+    # the resumable "last" state without re-reading the file.
+    extra = payload.get("extra") or {}
+    if extra:
+        trainer_state = payload.get("trainer_state", {})
+        trainer_state = dict(trainer_state) if isinstance(trainer_state, dict) else {}
+        trainer_state["best"] = extra
+        return trainer_state
     return payload.get("trainer_state", {})

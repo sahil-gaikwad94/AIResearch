@@ -478,6 +478,8 @@ class Kestrel7(nn.Module):
         model_status      = "randomly_initialized" until a real checkpoint is loaded
         checkpoint_loaded = False
         supports_autograd = True
+        weights_origin    = "random_init" (never inferred from an optimizer count)
+        capability_evaluation_status = "not_evaluated" by default
     """
 
     def __init__(self, config: dict, tokenizer_hash: Optional[str] = None):
@@ -508,6 +510,14 @@ class Kestrel7(nn.Module):
         self.checkpoint_loaded = False
         self.supports_autograd = True
         self.tokenizer_hash = tokenizer_hash
+        # P0.10: truthful capability metadata. A nonzero optimizer-step count
+        # is not evidence of capability, so origin, update count and any
+        # capability label are kept separate and never inferred from each other.
+        self.weights_origin = "random_init"
+        self.optimizer_updates = 0
+        self.tokens_seen = 0
+        self.checkpoint_artifact_id = None
+        self.capability_evaluation_status = "not_evaluated"
 
     def _init_weights(self) -> None:
         """Explicit initialization policy (PyTorch defaults are not a policy).
@@ -577,9 +587,11 @@ class Kestrel7(nn.Module):
         labels: Optional[torch.Tensor] = None,
         doc_ids: Optional[torch.Tensor] = None,
         mtp_weight: float = 0.2,
+        return_components: bool = False,
     ):
         logits, h, _ = self._forward_with_cache(input_ids, cache=None, seq_start=0, doc_ids=doc_ids)
         loss = None
+        components = None
         if labels is not None:
             # Exactly one shift: position t predicts token t+1.
             shift_logits = logits[..., :-1, :].contiguous()
@@ -594,22 +606,55 @@ class Kestrel7(nn.Module):
                 shift_logits.view(-1, self.vocab), flat_labels, ignore_index=-100
             )
             loss = ce_loss
+            mtp_loss_val = None
+            mtp_targets = 0
             if self.mtp_head is not None and input_ids.shape[1] >= 3 and mtp_weight > 0:
                 # Depth-1: h_t plus embed(x_{t+1}) predicts token t+2.
-                h_mtp = self.mtp_head(h[:, :-2, :], self.embed(input_ids[:, 1:-1]))
-                mtp_logits = self._project_logits(h_mtp)
-                mtp_labels = labels[:, 2:].contiguous().view(-1)
-                # The MTP mask is not assumed identical to the LM mask; a batch
-                # with no t+2 target simply contributes no auxiliary term.
-                if int((mtp_labels != -100).sum().item()) > 0:
-                    mtp_loss = F.cross_entropy(
+                # P0.1: validity requires all three positions to belong to the
+                # same non-padding document. Checking only that the t+2 label is
+                # not -100 is insufficient on packed streams: a transition can
+                # have t at the end of document A, t+1 equal to document B's
+                # BOS, and t+2 equal to the first content token in document B.
+                # That target is not necessarily masked, so the MTP head could
+                # learn across a document boundary even though the main
+                # next-token objective does not.
+                valid_mtp = labels[:, 2:] != -100
+                if doc_ids is not None:
+                    if doc_ids.shape != labels.shape:
+                        raise ValueError(
+                            f"doc_ids shape {tuple(doc_ids.shape)} != labels shape {tuple(labels.shape)}"
+                        )
+                    same_doc = (
+                        (doc_ids[:, :-2] >= 0)
+                        & (doc_ids[:, :-2] == doc_ids[:, 1:-1])
+                        & (doc_ids[:, 1:-1] == doc_ids[:, 2:])
+                    )
+                    valid_mtp = valid_mtp & same_doc
+                mtp_labels = labels[:, 2:].masked_fill(~valid_mtp, -100)
+                mtp_targets = int((mtp_labels != -100).sum().item())
+                if mtp_targets > 0:
+                    h_mtp = self.mtp_head(h[:, :-2, :], self.embed(input_ids[:, 1:-1]))
+                    mtp_logits = self._project_logits(h_mtp)
+                    mtp_loss_val = F.cross_entropy(
                         mtp_logits.reshape(-1, self.vocab),
-                        mtp_labels,
+                        mtp_labels.reshape(-1),
                         ignore_index=-100,
                     )
-                    loss = ce_loss + mtp_weight * mtp_loss
+                    loss = ce_loss + mtp_weight * mtp_loss_val
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite loss: {float(loss.detach())}")
+            if return_components:
+                # P0.2: expose the pieces so validation/test metrics can report
+                # next-token perplexity separately from the composite objective.
+                components = {
+                    "total_loss": loss,
+                    "next_token_ce": ce_loss,
+                    "mtp_loss": mtp_loss_val,
+                    "lm_target_count": n_lm_targets,
+                    "mtp_target_count": mtp_targets,
+                }
+        if return_components:
+            return logits, loss, components
         return logits, loss
 
     @torch.no_grad()

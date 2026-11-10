@@ -1,6 +1,6 @@
-"""Kestrel-7 training: WSD-style schedule, accumulation flush, reverse-KL distillation.
+"""Kestrel-7 training: WSD-style schedule, accumulation flush, checkpoints.
 
-Fixes inherited from the Day-6 audit:
+Fixes inherited from the Day-6 audit and the Day-7 upgrade specification:
 
 *   **Partial accumulation flush (P1-03).** A trailing group smaller than
     ``grad_accum_steps`` is rescaled (``grad_accum_steps / pending``) and stepped
@@ -17,6 +17,21 @@ Fixes inherited from the Day-6 audit:
     at 10-30x the GPU cost. Implemented natively in torch so gradients reach the
     student logits (the reference's NumPy bridge detached them). Falsifier:
     KL(pi || pi) not exactly 0, or a non-zero student gradient missing.
+*   **P0.3 best/last checkpoints.** The best next-token-CE weights are saved to a
+    separate artifact from the resumable last state, atomically, with the metric
+    and step that produced them. Falsifier: a "best" file whose stored loss is
+    not the best observed loss.
+*   **P0.4 token-weighted accumulation.** Accumulated loss *sums* and valid-token
+    *counts* are normalised at the optimizer boundary, so micro-batches with
+    different numbers of ignored labels weight equally. Falsifier: gradients
+    from one concatenated batch differing from the same examples split across
+    micro-batches.
+*   **P0.5 reproducible sampler.** The per-epoch permutation, batch cursor,
+    optimizer step, token cursor, scheduler state and data-manifest hash are
+    persisted; checkpoints are written periodically and atomically.
+*   **P0.10 truthful metadata.** ``weights_origin``, ``optimizer_updates`` and
+    ``capability_evaluation_status`` are tracked separately; a nonzero step
+    count is never read as capability.
 """
 
 from __future__ import annotations
@@ -126,8 +141,17 @@ class Kestrel7Trainer:
         self.token_count = 0
         self.last_val_tokens = 0
         self.best_val_loss = float("inf")
+        # P0.3: the best-checkpoint criterion is next-token CE, tracked
+        # separately from the legacy composite ``best_val_loss`` so a "best"
+        # artifact can never be confused with the last resumable state.
+        self.best_next_token_ce = float("inf")
+        self.best_checkpoint_path: Optional[str] = None
         self.history: List[dict] = []
         self._accum_pending = 0
+        self._accum_ce_sum = 0.0
+        self._accum_lm_tokens = 0
+        self._accum_mtp_sum = 0.0
+        self._accum_mtp_tokens = 0
         self.last_val_metrics: Dict[str, float] = {}
         # Resume cursor: the next epoch and the number of batches already
         # consumed in it. Meaningful for deterministic (shuffle=False) loaders;
@@ -156,30 +180,55 @@ class Kestrel7Trainer:
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
+        """Validation metrics with next-token CE and MTP reported separately.
+
+        Perplexity is computed from next-token cross-entropy only. The composite
+        objective is reported as ``val_total_objective`` and is never labelled
+        perplexity (P0.2).
+        """
         if self.val_loader is None:
             return {}
         self.model.eval()
-        total_loss = 0.0
-        total_tokens = 0
+        ce_sum = 0.0
+        mtp_sum = 0.0
+        total_obj = 0.0
+        lm_tokens = 0
+        mtp_tokens = 0
         for batch in self.val_loader:
             ids, lbls, docs = self._unpack(batch)
-            _, loss = self.model(ids, labels=lbls, doc_ids=docs)
-            n_tok = int((lbls[:, 1:] != -100).sum().item())
-            total_loss += float(loss.item()) * n_tok
-            total_tokens += n_tok
-        if total_tokens == 0:
+            _, _, comps = self.model(
+                ids, labels=lbls, doc_ids=docs, return_components=True
+            )
+            n_lm = int(comps["lm_target_count"])
+            n_mtp = int(comps["mtp_target_count"])
+            ce_sum += float(comps["next_token_ce"]) * n_lm
+            lm_tokens += n_lm
+            if comps["mtp_loss"] is not None and n_mtp > 0:
+                mtp_sum += float(comps["mtp_loss"]) * n_mtp
+                mtp_tokens += n_mtp
+            total_obj += float(comps["total_loss"]) * n_lm
+        if lm_tokens == 0:
             raise RuntimeError("Validation set contains no valid language-model targets")
-        val_loss = total_loss / total_tokens
-        if not math.isfinite(val_loss):
-            raise RuntimeError(f"Non-finite validation loss: {val_loss}")
-        # Only a computed, finite metric may set the best-checkpoint value.
-        self.best_val_loss = min(self.best_val_loss, val_loss)
-        # A clamped perplexity would contradict its own unreported loss; above the
-        # float range report inf explicitly instead of a finite-looking number.
+        val_next_token_ce = ce_sum / lm_tokens
+        val_mtp_loss = (mtp_sum / mtp_tokens) if mtp_tokens > 0 else 0.0
+        val_total_objective = total_obj / lm_tokens
+        if not math.isfinite(val_next_token_ce):
+            raise RuntimeError(f"Non-finite validation next-token CE: {val_next_token_ce}")
+        # Best-checkpoint criterion (P0.3) is next-token CE, never the composite.
+        if val_next_token_ce < self.best_next_token_ce:
+            self.best_next_token_ce = val_next_token_ce
+            self._save_best_checkpoint(val_next_token_ce)
         self.last_val_metrics = {
-            "val_loss": val_loss,
-            "val_ppl": math.exp(val_loss) if val_loss < 20.0 else float("inf"),
-            "val_tokens": total_tokens,
+            "val_next_token_ce": val_next_token_ce,
+            "val_next_token_ppl": math.exp(val_next_token_ce) if val_next_token_ce < 20.0 else float("inf"),
+            "val_mtp_loss": val_mtp_loss,
+            "val_total_objective": val_total_objective,
+            "val_lm_tokens": lm_tokens,
+            "val_mtp_tokens": mtp_tokens,
+            # Legacy keys kept for callers that read val_loss/val_ppl.
+            "val_loss": val_total_objective,
+            "val_ppl": math.exp(val_next_token_ce) if val_next_token_ce < 20.0 else float("inf"),
+            "val_tokens": lm_tokens,
         }
         self.model.train()
         return self.last_val_metrics

@@ -86,6 +86,7 @@ class Trainer:
         self.best_val_loss = float("inf")
         self.history: list = []
         self.nan_count = 0
+        self._accum_pending = 0
 
         total, trainable = count_params(model)
         print(f"[kestrel6] model: total={total:,} trainable={trainable:,}")
@@ -103,13 +104,15 @@ class Trainer:
         loss.backward()
 
         self.step += 1
-        if self.step % self.grad_accum_steps == 0:
+        self._accum_pending += 1
+        if self._accum_pending >= self.grad_accum_steps:
             if self.grad_clip and self.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.optimizer.step()
             self.optimizer.zero_grad()
             if self.scheduler is not None:
                 self.scheduler.step()
+            self._accum_pending = 0
 
         n_tokens = int((labels != -100).sum().item())
         self.token_count += n_tokens
@@ -177,10 +180,46 @@ class Trainer:
             if max_tokens is not None and self.token_count >= max_tokens:
                 break
 
+        # P1-03: flush the final partial gradient-accumulation group instead of
+        # silently dropping it. Gradients were scaled by 1/grad_accum_steps, so
+        # rescale by grad_accum_steps / pending before the optimizer step.
+        if self._accum_pending > 0:
+            scale_correction = self.grad_accum_steps / float(self._accum_pending)
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    p.grad *= scale_correction
+            if self.grad_clip and self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            if self.scheduler is not None:
+                self.scheduler.step()
+            self._accum_pending = 0
+
+        # P1-03: always validate before saving, even when val_every_tokens is
+        # larger than the corpus; otherwise the checkpoint records best=inf.
         final = {"step": self.step, "tokens": self.token_count, "best_val_loss": self.best_val_loss}
+        if self.val_loader is not None:
+            metrics = self.validate()
+            final.update(metrics)
+            final["best_val_loss"] = self.best_val_loss
+            print(f"[val final step {self.step}] " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+
         if self.checkpoint_dir:
             os.makedirs(self.checkpoint_dir, exist_ok=True)
             ckpt_path = os.path.join(self.checkpoint_dir, f"{self.run_name}_step{self.step}.pt")
-            save_checkpoint(self.model, self.optimizer, self.scheduler, self.step, self.token_count, ckpt_path)
+            save_checkpoint(
+                self.model,
+                self.optimizer,
+                self.scheduler,
+                self.step,
+                self.token_count,
+                ckpt_path,
+                best_val_loss=self.best_val_loss,
+                history=self.history,
+                seed=self.seed,
+                run_name=self.run_name,
+            )
+            final["checkpoint_path"] = ckpt_path
             print(f"[kestrel6] checkpoint saved -> {ckpt_path}")
         return final

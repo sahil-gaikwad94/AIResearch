@@ -1,0 +1,39 @@
+name: research
+
+on:
+  push:
+    paths:
+      - "research/**"
+      - ".github/workflows/research.yml"
+  pull_request:
+    paths:
+      - "research/**"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No lockfile exists in this repository, so versions are unpinned and the
+      # CPU wheel index is used to avoid a multi-gigabyte CUDA download.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy sympy pytest
+
+      - name: Day 6 suite
+        run: python -m pytest research/day6/tests/ -q
+
+      - name: Day 7 suite
+        run: python -m pytest research/day7/tests/ -q
+
+      # Fails if metrics.json (and therefore the docs that quote it) drifted
+      # from what the model code actually produces.
+      - name: Ledger drift check
+        run: python research/day7/tools/param_ledger_v7.py --check

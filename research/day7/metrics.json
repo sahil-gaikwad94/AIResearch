@@ -1,0 +1,128 @@
+{
+  "benchmark": {
+    "categories": {
+      "code_generation": {
+        "earned": 20,
+        "passed": 5,
+        "points": 20,
+        "status": "implemented",
+        "tasks": 5
+      },
+      "code_tracing": {
+        "earned": 4,
+        "passed": 4,
+        "points": 4,
+        "status": "implemented",
+        "tasks": 4
+      },
+      "formal_reasoning": {
+        "earned": 5,
+        "passed": 5,
+        "points": 5,
+        "status": "implemented",
+        "tasks": 5
+      },
+      "mathematics": {
+        "earned": 7,
+        "passed": 7,
+        "points": 7,
+        "status": "implemented",
+        "tasks": 7
+      },
+      "research_calibration": {
+        "earned": 8,
+        "passed": 8,
+        "points": 8,
+        "status": "implemented (rule-based tripwire)",
+        "tasks": 8
+      },
+      "science": {
+        "earned": 4,
+        "passed": 4,
+        "points": 4,
+        "status": "implemented",
+        "tasks": 4
+      }
+    },
+    "earned": 48,
+    "failures": [],
+    "pct": 100.0,
+    "points": 48,
+    "suite": "Kestrel6_TempBench",
+    "tasks": 33
+  },
+  "config_names": [
+    "BASELINE_100M",
+    "SMALL_HYBRID",
+    "TINY_DENSE",
+    "TINY_HYBRID"
+  ],
+  "generated_by": "research/day7/tools/param_ledger_v7.py",
+  "presets": {
+    "BASELINE_100M": {
+      "d": 768,
+      "gdn_state_bytes_fp32_batch1": 2018304,
+      "kv_cache_bytes_all_full_counterfactual_fp16": 50331648,
+      "kv_cache_bytes_fp16_ctx": 12582912,
+      "kv_reduction_vs_all_full_pct": 75.0,
+      "layers": 12,
+      "layers_full": 3,
+      "layers_gdn": 9,
+      "max_ctx": 4096,
+      "mtp_depth": 1,
+      "total_params": 105062040,
+      "total_params_pretty": "105,062,040",
+      "trainable_params": 105062040,
+      "vocab": 32000
+    },
+    "SMALL_HYBRID": {
+      "d": 512,
+      "gdn_state_bytes_fp32_batch1": 897024,
+      "kv_cache_bytes_all_full_counterfactual_fp16": 8388608,
+      "kv_cache_bytes_fp16_ctx": 2097152,
+      "kv_reduction_vs_all_full_pct": 75.0,
+      "layers": 8,
+      "layers_full": 2,
+      "layers_gdn": 6,
+      "max_ctx": 1024,
+      "mtp_depth": 1,
+      "total_params": 37844704,
+      "total_params_pretty": "37,844,704",
+      "trainable_params": 37844704,
+      "vocab": 16384
+    },
+    "TINY_DENSE": {
+      "d": 256,
+      "gdn_state_bytes_fp32_batch1": 0,
+      "kv_cache_bytes_all_full_counterfactual_fp16": 1048576,
+      "kv_cache_bytes_fp16_ctx": 1048576,
+      "kv_reduction_vs_all_full_pct": 0.0,
+      "layers": 4,
+      "layers_full": 4,
+      "layers_gdn": 0,
+      "max_ctx": 512,
+      "mtp_depth": 1,
+      "total_params": 6032128,
+      "total_params_pretty": "6,032,128",
+      "trainable_params": 6032128,
+      "vocab": 8192
+    },
+    "TINY_HYBRID": {
+      "d": 256,
+      "gdn_state_bytes_fp32_batch1": 125952,
+      "kv_cache_bytes_all_full_counterfactual_fp16": 1048576,
+      "kv_cache_bytes_fp16_ctx": 262144,
+      "kv_reduction_vs_all_full_pct": 75.0,
+      "layers": 4,
+      "layers_full": 1,
+      "layers_gdn": 3,
+      "max_ctx": 512,
+      "mtp_depth": 1,
+      "total_params": 6250192,
+      "total_params_pretty": "6,250,192",
+      "trainable_params": 6250192,
+      "vocab": 8192
+    }
+  },
+  "torch_version": "2.15.0+cpu"
+}

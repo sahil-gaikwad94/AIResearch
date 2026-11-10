@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 
@@ -41,9 +42,6 @@ def main():
 
     device = torch.device(args.device)
     cfg = get_config(args.preset)
-    model = build_model(cfg)
-    total, trainable = count_params(model)
-    print(f"[kestrel6] preset={args.preset} total={total:,} trainable={trainable:,}")
 
     # Tiny synthetic corpus so the run is self-contained and fast.
     corpus = [
@@ -59,8 +57,33 @@ def main():
         "Once upon a time there was a small model named Kestrel.",
     ] * 50
 
-    tok = BPETokenizer.train(corpus, vocab_size=min(cfg["vocab"], 512))
-    train_texts, val_texts, _ = train_val_test_split(corpus, seed=args.seed)
+    # P1-01: deduplicate by SHA-256 content hash BEFORE splitting, then train
+    # the BPE tokenizer on the train split only. Repeating the corpus 50x and
+    # splitting afterwards leaked every validation document into training.
+    seen = set()
+    unique_corpus = []
+    for text in corpus:
+        h = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            unique_corpus.append(text)
+    train_texts, val_texts, test_texts = train_val_test_split(
+        unique_corpus, train_frac=0.7, val_frac=0.2, seed=args.seed
+    )
+    print(
+        f"[kestrel6] data: raw={len(corpus)} unique={len(unique_corpus)} "
+        f"train={len(train_texts)} val={len(val_texts)} test={len(test_texts)}"
+    )
+
+    tok = BPETokenizer.train(train_texts, vocab_size=min(cfg["vocab"], 512))
+    # P0-05: the model's logit space must match the tokenizer exactly.
+    cfg["vocab"] = tok.vocab_size
+    model = build_model(cfg)
+    total, trainable = count_params(model)
+    print(
+        f"[kestrel6] preset={args.preset} total={total:,} trainable={trainable:,} "
+        f"vocab={cfg['vocab']} (tokenizer={tok.vocab_size})"
+    )
 
     train_ds = PackedDataset(tok, train_texts, seq_len=args.seq_len, seed=args.seed)
     val_ds = PackedDataset(tok, val_texts, seq_len=args.seq_len, seed=args.seed)

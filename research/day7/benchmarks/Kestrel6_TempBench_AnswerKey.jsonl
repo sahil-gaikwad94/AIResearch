@@ -1,0 +1,33 @@
+{"id": "math-01", "category": "mathematics", "points": 1, "expected": "1168"}
+{"id": "math-02", "category": "mathematics", "points": 1, "expected": "1"}
+{"id": "math-03", "category": "mathematics", "points": 1, "expected": "4,3"}
+{"id": "math-04", "category": "mathematics", "points": 1, "expected": "9"}
+{"id": "math-05", "category": "mathematics", "points": 1, "expected": "12"}
+{"id": "math-06", "category": "mathematics", "points": 1, "expected": "DIV_BY_ZERO"}
+{"id": "math-07", "category": "mathematics", "points": 1, "expected": "16"}
+{"id": "formal-01", "category": "formal_reasoning", "points": 1, "expected": "D,A,B,C"}
+{"id": "formal-02", "category": "formal_reasoning", "points": 1, "expected": "no"}
+{"id": "formal-03", "category": "formal_reasoning", "points": 1, "expected": "B"}
+{"id": "formal-04", "category": "formal_reasoning", "points": 1, "expected": "no"}
+{"id": "formal-05", "category": "formal_reasoning", "points": 1, "expected": "not P"}
+{"id": "trace-01", "category": "code_tracing", "points": 1, "expected": "'c'"}
+{"id": "trace-02", "category": "code_tracing", "points": 1, "expected": "[[1, 6], [8, 10], [15, 18]]"}
+{"id": "trace-03", "category": "code_tracing", "points": 1, "expected": "4"}
+{"id": "trace-04", "category": "code_tracing", "points": 1, "expected": "6"}
+{"id": "gen-01", "category": "code_generation", "points": 4, "expected": "4/4"}
+{"id": "gen-02", "category": "code_generation", "points": 4, "expected": "4/4"}
+{"id": "gen-03", "category": "code_generation", "points": 4, "expected": "4/4"}
+{"id": "gen-04", "category": "code_generation", "points": 4, "expected": "4/4"}
+{"id": "gen-05", "category": "code_generation", "points": 4, "expected": "4/4"}
+{"id": "sci-01", "category": "science", "points": 1, "expected": "19.8"}
+{"id": "sci-02", "category": "science", "points": 1, "expected": "0.25"}
+{"id": "sci-03", "category": "science", "points": 1, "expected": "1/4"}
+{"id": "sci-04", "category": "science", "points": 1, "expected": "3.2"}
+{"id": "res-01", "category": "research_calibration", "points": 1, "expected": "not established"}
+{"id": "res-02", "category": "research_calibration", "points": 1, "expected": "8 units"}
+{"id": "res-03", "category": "research_calibration", "points": 1, "expected": "not justified"}
+{"id": "res-04", "category": "research_calibration", "points": 1, "expected": "INSUFFICIENT EVIDENCE"}
+{"id": "res-05", "category": "research_calibration", "points": 1, "expected": "equal"}
+{"id": "res-06", "category": "research_calibration", "points": 1, "expected": "UNKNOWN"}
+{"id": "res-07", "category": "research_calibration", "points": 1, "expected": "CONFLICT"}
+{"id": "res-08", "category": "research_calibration", "points": 1, "expected": "established"}

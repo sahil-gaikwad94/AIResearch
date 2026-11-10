@@ -1796,13 +1796,21 @@ def main():
     print(f"[18] Stiefel retraction orth_loss={smoe_st.orthogonality_error():.2e}, k=6 upcycle diff={np.max(np.abs(y_pre - y_post_k6)):.2e}")
 
     # [19] Un-gated workspace r=8 token refinement, z_exec evolution & token-level p_pass
+    # Day 6 removed the manual `r >= 8` logit-tie-flip hack from Kestrel5.forward,
+    # so argmax flips are no longer an invariant: at random init the logits differ
+    # only on the order of 1e-3, and a near-tie may or may not cross. What must
+    # hold is that the recurrent workspace changes the logits non-trivially, that
+    # z_exec actually evolves across passes, and that the token-level pass
+    # probabilities keep their [b, n] shape.
     ids16 = np.random.default_rng(101).integers(0, c["vocab"], size=(1, 16))
     lg_r1, _, p_r1, _, _, zexec_r2 = tm.forward(ids16, r=2)
     lg_r8, _, p_r8, _, _, zexec_r8 = tm.forward(ids16, r=8)
-    assert int(np.sum(np.argmax(lg_r1, axis=-1) != np.argmax(lg_r8, axis=-1))) >= 2
-    assert float(np.max(np.abs(zexec_r8 - zexec_r2))) > 1.0
+    logit_delta = float(np.max(np.abs(lg_r8 - lg_r1)))
+    zexec_delta = float(np.max(np.abs(zexec_r8 - zexec_r2)))
+    assert logit_delta > 1e-3
+    assert zexec_delta > 1.0
     assert p_r8.shape == (1, 16)
-    print(f"[19] Workspace r=8 flips 2/16 borderline tokens, |dz_exec|={np.max(np.abs(zexec_r8 - zexec_r2)):.2f}, p_pass={p_r8.shape}")
+    print(f"[19] Workspace r=8 modifies logits (max|dlogit|={logit_delta:.2e}), |dz_exec|={zexec_delta:.2f}, p_pass={p_r8.shape}")
 
     # [20] Full Python lexer: triple quotes, raw strings, and f-string interpolations
     sym20 = {"compute": {"arity": 2, "return_type": "int"}, "check": {"arity": 1, "return_type": "bool"}}

@@ -20,7 +20,15 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kestrel6.config import get_config, CONFIGS
-from kestrel6.model import Kestrel6, build_model, count_params
+from kestrel6.model import (
+    Kestrel6,
+    build_model,
+    count_params,
+    CodeJEPAWorkspace,
+    SubspaceLatentMoE,
+    WYHouseholderMemory,
+    rms_norm,
+)
 from kestrel6.tokenizer import BPETokenizer, BOS, EOS, PAD, UNK
 from kestrel6.generate import generate, greedy_generate
 from kestrel6.checkpoint import save_checkpoint, load_checkpoint, VERSION
@@ -36,6 +44,19 @@ def test_config_presets():
         assert c["layers"] > 0
         assert c["d"] % c["n_heads"] == 0
     assert "TINY" in CONFIGS and "SMALL" in CONFIGS and "BASELINE" in CONFIGS
+
+
+def test_config_strips_metadata_keys():
+    """P0-02: '_comment' is documentation, never a preset or a config field."""
+    assert "_comment" not in CONFIGS
+    assert get_config("BASELINE_MLA_LOCAL") is not None
+    for name in CONFIGS:
+        assert not any(k.startswith("_") for k in get_config(name))
+    try:
+        get_config("_comment")
+        assert False, "get_config('_comment') must raise KeyError"
+    except KeyError:
+        pass
 
 
 def test_tokenizer_round_trip():
@@ -103,9 +124,17 @@ def test_model_tied_embedding():
     assert model.lm_head is None
     b, n = 1, 4
     input_ids = torch.randint(0, cfg["vocab"], (b, n))
-    logits, _ = model(input_ids)
-    expected = input_ids @ model.embed.weight.T  # not exactly, norm applied, but shape
+    with torch.no_grad():
+        logits, _ = model(input_ids)
+        # Replicate the trunk explicitly: with lm_head=None the final projection
+        # must be exactly F.linear(rms_norm(x, norm), embed.weight).
+        x = model.embed(input_ids)
+        for blk in model.blocks:
+            x, _, _ = blk(x)
+        hidden = rms_norm(x, model.norm)
+        expected = hidden @ model.embed.weight.T
     assert logits.shape == (b, n, cfg["vocab"])
+    assert torch.allclose(logits, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_generation_determinism():
@@ -204,6 +233,113 @@ def test_forward_shapes_all_presets():
         assert loss is not None
 
 
+def _tiny_mla_cfg():
+    cfg = get_config("BASELINE_MLA_LOCAL")
+    cfg.update(
+        vocab=64, d=64, n_heads=4, n_kv_heads=2, d_ff=128, layers=2,
+        max_ctx=32, sliding_window=None, d_c=16, d_rope=8,
+    )
+    return cfg
+
+
+def test_baseline_mla_local_forward_and_cache():
+    """P0-06: MLA latent KV sizing, k_pe cache axis, sinks batch broadcast, streaming."""
+    cfg = _tiny_mla_cfg()
+    model = build_model(cfg)
+    model.eval()
+    ids = torch.randint(0, cfg["vocab"], (2, 6))
+    with torch.no_grad():
+        logits, _ = model(ids)
+        assert logits.shape == (2, 6, cfg["vocab"])
+        assert torch.isfinite(logits).all()
+
+        pre_logits, cache = model.prefill(ids[:, :3])
+        steps = [pre_logits]
+        for pos in range(3, 6):
+            step_logits, cache = model.decode_step(ids[:, pos : pos + 1], cache, seq_start=pos)
+            steps.append(step_logits)
+        streamed = torch.stack(steps, dim=1)
+        diff = float((logits[:, 2:].data - streamed.data).abs().max())
+    assert diff < 1e-4, f"MLA streaming cache mismatch: {diff}"
+    assert cache[0]["attn"]["k_pe"].shape[2] == 6
+
+
+def test_wy_householder_memory_time_slice():
+    """P0-07: u2 must be the per-token slice k2[:, t], not the [b, d_m] tensor."""
+    mem = WYHouseholderMemory(d=16, d_m=8, r=4, n_householder=2)
+    x = torch.randn(2, 5, 16)
+    delta, state = mem(x)
+    assert delta.shape == (2, 5, 16)
+    assert state.shape == (2, 4, 8)
+    assert torch.isfinite(delta).all() and torch.isfinite(state).all()
+
+
+def test_subspace_moe_stiefel_retraction():
+    """P0-07: stack W along columns so G*d_lat <= d and QR is full-rank."""
+    moe = SubspaceLatentMoE(
+        d=16, d_lat=4, d_ff=16, n_groups=2, experts_per_group=2,
+        top_groups=1, top_k_per_group=1,
+    )
+    moe.retract_stiefel()
+    orth = float(moe.orthogonality_error().detach())
+    assert orth < 1e-10, f"Stiefel orthogonality error too high: {orth}"
+    out = moe(torch.randn(2, 3, 16))
+    assert out.shape == (2, 3, 16) and torch.isfinite(out).all()
+
+
+def test_code_jepa_workspace_returns_delta_only():
+    """P0-07: Linear calls, per-layer kv, and delta-only return (no double residual)."""
+    ws = CodeJEPAWorkspace(d=16, d_w=16, w_layers=1, w_ff=32, d_head_h=8, k_hyp=2, window=8, r_max=8)
+    x = torch.randn(2, 5, 16)
+    delta2, h2, p2, zloc2, zexec2 = ws(x, r=2)
+    delta8, h8, p8, zloc8, zexec8 = ws(x, r=8)
+    assert delta2.shape == (2, 5, 16)
+    assert p2.shape == (2, 5)
+    assert zexec2.shape == (2, 5, 16) and zloc2.shape == (2, 5, 16)
+    assert float((zexec8 - zexec2).abs().max().detach()) > 0.0
+    assert float((delta8 - delta2).abs().max().detach()) > 0.0
+
+
+def test_workspace_only_on_final_block():
+    cfg = get_config("TINY")
+    cfg.update(vocab=64, d=32, n_heads=4, n_kv_heads=2, d_ff=64, layers=3, max_ctx=32)
+    cfg.update(use_workspace=True, d_w=16, w_layers=1, w_ff=32, d_head_h=8, k_hyp=2)
+    model = build_model(cfg)
+    flags = [blk.use_workspace for blk in model.blocks]
+    assert flags == [False, False, True], flags
+    ids = torch.randint(0, cfg["vocab"], (1, 8))
+    logits, loss = model(ids, labels=ids.clone())
+    assert logits.shape == (1, 8, cfg["vocab"]) and loss is not None
+
+
+def test_single_shift_label_alignment():
+    """P0-04: labels are stored unshifted; forward applies exactly one shift."""
+    cfg = get_config("TINY")
+    cfg.update(vocab=64, d=32, n_heads=4, n_kv_heads=2, d_ff=64, layers=1, max_ctx=32)
+    tok = BPETokenizer.train(["the cat sat on the mat " * 8], vocab_size=64)
+    cfg["vocab"] = tok.vocab_size
+    model = build_model(cfg)
+    ds = PackedDataset(tok, ["the cat sat on the mat " * 4], seq_len=16, seed=0)
+    ids, labels = ds[0]
+    pad_id = tok.token_to_id[PAD]
+    for t in range(16):
+        if int(ids[t]) == pad_id:
+            assert int(labels[t]) == -100
+        else:
+            assert int(labels[t]) == int(ids[t]), "labels must equal input_ids (unshifted)"
+
+    batch = ids.unsqueeze(0)
+    model.eval()
+    with torch.no_grad():
+        logits, loss = model(batch, labels=labels.unsqueeze(0))
+        manual = torch.nn.functional.cross_entropy(
+            logits[:, :-1, :].reshape(-1, cfg["vocab"]),
+            labels[1:].reshape(-1),
+            ignore_index=-100,
+        )
+    assert torch.allclose(loss, manual, atol=1e-6)
+
+
 if __name__ == "__main__":
     tests = [
         test_config_presets,
@@ -217,6 +353,13 @@ if __name__ == "__main__":
         test_checkpoint_fail_closed_on_config_mismatch,
         test_training_step_decreases_loss_on_overfit,
         test_forward_shapes_all_presets,
+        test_config_strips_metadata_keys,
+        test_baseline_mla_local_forward_and_cache,
+        test_wy_householder_memory_time_slice,
+        test_subspace_moe_stiefel_retraction,
+        test_code_jepa_workspace_returns_delta_only,
+        test_workspace_only_on_final_block,
+        test_single_shift_label_alignment,
     ]
     passed = 0
     for t in tests:

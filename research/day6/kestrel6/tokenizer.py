@@ -214,7 +214,7 @@ class BPETokenizer:
         tok = cls(
             vocab=payload.get("token_to_id"),
             merges=[tuple(m) for m in payload.get("merges", [])],
-            special_tokens=payload.get("special_tokens", SPECIAL_TOKENS),
+            special_tokens=payload.get("special_tokens") or payload.get("specials") or SPECIAL_TOKENS,
         )
         tok.vocab_size = payload.get("vocab_size", len(tok.token_to_id))
         return tok

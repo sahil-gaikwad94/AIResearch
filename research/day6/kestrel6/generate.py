@@ -35,10 +35,12 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_p: Optional[
 
     temperature == 0 (or None) => deterministic argmax (greedy).
     """
-    if temperature is not None and temperature > 0 and temperature != 1.0:
-        logits = logits / temperature
-    if temperature is not None and temperature == 0.0:
+    # P2-01: temperature None or <= 0 is the deterministic greedy contract.
+    # The old code let temperature=None fall through to multinomial sampling.
+    if temperature is None or temperature <= 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
+    if temperature != 1.0:
+        logits = logits / temperature
     if top_p is not None and top_p < 1.0:
         logits = top_p_filter(logits, top_p)
     probs = F.softmax(logits, dim=-1)

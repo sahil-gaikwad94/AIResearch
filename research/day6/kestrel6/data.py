@@ -3,8 +3,10 @@
 Deterministic, restartable data loading for language modeling:
 
   * Packs documents into fixed-length sequences (no cross-document attention).
-  * Builds next-token labels shifted by one token, with document boundaries
-    masked (label = -100 at the first token of each packed document).
+  * Stores *unshifted* next-token labels (labels[t] == input_ids[t] where
+    supervised): Kestrel6.forward applies exactly one shift, so shifting here
+    as well would train the model to predict token t+2. Padding is masked to
+    -100 so it never contributes to the loss.
   * Train / validation / test split done *before* training.
   * Document-level shuffling with a pinned seed.
   * Each sample records its source manifest and token count.
@@ -43,27 +45,25 @@ class PackedDataset(Dataset):
         doc_order = list(range(len(texts)))
         rng.shuffle(doc_order)
 
+        pad_id = tokenizer.token_to_id.get("<|pad|>", 0)
+
         for di in doc_order:
             text = texts[di]
-            ids = tokenizer.encode(text, add_bos=add_bos, add_eos=False)
+            ids = tokenizer.encode(text, add_bos=add_bos, add_eos=True)
             if len(ids) == 0:
                 continue
-            # Pack multiple documents into one sequence; mark the first token
-            # of each packed document so its label can be ignored at the
-            # boundary (no cross-document attention).
+            # Pack multiple documents into one sequence. Labels are stored
+            # UNSHIFTED: Kestrel6.forward already aligns logits[..., :-1, :]
+            # against labels[..., 1:]. Shifting here as well would make the
+            # model predict token t+2 (P0-04 double label-shift bug).
             pos = 0
             while pos < len(ids):
                 chunk = ids[pos : pos + seq_len]
                 pos += seq_len
                 if len(chunk) < 2:
                     continue
-                labels = chunk[1:] + [tokenizer.token_to_id.get("<|eos|>", -100)]
-                # The first token of a packed document (after the very first)
-                # should not predict across the boundary: set its label to -100.
-                if pos < len(ids):
-                    labels[-1] = -100
-                ids_padded = chunk + [tokenizer.token_to_id.get("<|pad|>", 0)] * (seq_len - len(chunk))
-                labels_padded = labels + [-100] * (seq_len - len(labels))
+                ids_padded = chunk + [pad_id] * (seq_len - len(chunk))
+                labels_padded = list(chunk) + [-100] * (seq_len - len(chunk))
                 self.examples.append((ids_padded, labels_padded))
 
     def __len__(self):

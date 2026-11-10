@@ -31,6 +31,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import get_config
+
 
 # --------------------------------------------------------------------------- primitives
 
@@ -104,15 +106,22 @@ class CausalSelfAttention(nn.Module):
         self.w_o = nn.Linear(n_heads * self.head_dim, d, bias=False)
 
         # RoPE tables (lazily materialized to the right device/dtype on first use).
-        self.register_buffer("cos", torch.empty(0), persistent=False)
-        self.register_buffer("sin", torch.empty(0), persistent=False)
+        # 3D shape [1, 0, head_dim // 2] keeps `self.cos.shape[1]` valid before
+        # the first forward pass (P0-01: a 1D empty buffer raised IndexError).
+        self.register_buffer("cos", torch.empty(1, 0, self.head_dim // 2), persistent=False)
+        self.register_buffer("sin", torch.empty(1, 0, self.head_dim // 2), persistent=False)
 
     def _rope(self, x: torch.Tensor, seq_start: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_len = x.shape[1] + seq_start
         device = x.device
         dtype = x.dtype
-        if self.cos.shape[1] < seq_len or self.cos.device != device:
-            cos, sin = rope_cos_sin(seq_len, self.head_dim, self.rope_theta, device, dtype)
+        if (
+            self.cos.ndim != 3
+            or self.cos.shape[1] < seq_len
+            or self.cos.device != device
+            or self.cos.dtype != dtype
+        ):
+            cos, sin = rope_cos_sin(max(seq_len, 64), self.head_dim, self.rope_theta, device, dtype)
             self.cos = cos
             self.sin = sin
         cos = self.cos[:, seq_start : seq_start + x.shape[1], :]
@@ -210,20 +219,28 @@ class LocalMLA(nn.Module):
         self.w_qr = nn.Linear(d_c, n_heads * d_rope, bias=False)
         self.w_dkv = nn.Linear(d, d_c + d_rope, bias=False)
         self.ckv_norm = nn.Parameter(torch.ones(d_c))
-        self.w_uk = nn.Linear(d_c, n_heads * head_dim, bias=False)
-        self.w_uv = nn.Linear(d_c, n_heads * head_dim, bias=False)
+        # Project the shared latent to the *KV* head count; the tensors are
+        # reshaped to n_kv_heads * head_dim (P0-06: sizing these to n_heads
+        # made the projection output 3x larger than the reshape).
+        self.w_uk = nn.Linear(d_c, n_kv_heads * head_dim, bias=False)
+        self.w_uv = nn.Linear(d_c, n_kv_heads * head_dim, bias=False)
         self.w_o = nn.Linear(n_heads * head_dim, d, bias=False)
         self.sinks = nn.Parameter(torch.zeros(n_heads))
 
-        self.cos = nn.Parameter(torch.empty(0), requires_grad=False)
-        self.sin = nn.Parameter(torch.empty(0), requires_grad=False)
+        self.register_buffer("cos", torch.empty(1, 0, self.d_rope // 2), persistent=False)
+        self.register_buffer("sin", torch.empty(1, 0, self.d_rope // 2), persistent=False)
 
     def _rope(self, x: torch.Tensor, seq_start: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_len = x.shape[1] + seq_start
         device = x.device
         dtype = x.dtype
-        if self.cos.shape[1] < seq_len or self.cos.device != device:
-            cos, sin = rope_cos_sin(seq_len, self.d_rope, self.rope_theta, device, dtype)
+        if (
+            self.cos.ndim != 3
+            or self.cos.shape[1] < seq_len
+            or self.cos.device != device
+            or self.cos.dtype != dtype
+        ):
+            cos, sin = rope_cos_sin(max(seq_len, 64), self.d_rope, self.rope_theta, device, dtype)
             self.cos = cos
             self.sin = sin
         return self.cos[:, seq_start : seq_start + x.shape[1], :], self.sin[:, seq_start : seq_start + x.shape[1], :]
@@ -242,9 +259,7 @@ class LocalMLA(nn.Module):
 
         q_nope = self.w_uq(cq).view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
         q_pe = self.w_qr(cq).view(b, n, self.n_heads, self.d_rope).transpose(1, 2)
-        k_nope = self.w_uk(ckv).view(b, n, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        k_pe = k_pe_full.view(b, n, 1, self.d_rope).transpose(1, 2)
-        v = self.w_uv(ckv).view(b, n, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        k_pe = k_pe_full.view(b, n, 1, self.d_rope).transpose(1, 2)  # [b, 1, n, d_rope]
 
         cos, sin = self._rope(x, seq_start)
         q_pe = apply_rope(q_pe, cos, sin)
@@ -254,7 +269,9 @@ class LocalMLA(nn.Module):
         new_cache: Dict[str, torch.Tensor] = {}
         if cache is not None and "ckv" in cache:
             ckv = torch.cat([cache["ckv"], ckv], dim=1)
-            k_pe = torch.cat([cache["k_pe"], k_pe], dim=1)
+            # k_pe is [b, 1, seq, d_rope]: concatenate on the sequence dim (2),
+            # not the head dim (P0-06: dim=1 corrupted the cached rotary slice).
+            k_pe = torch.cat([cache["k_pe"], k_pe], dim=2)
         new_cache["ckv"] = ckv
         new_cache["k_pe"] = k_pe
 
@@ -277,7 +294,9 @@ class LocalMLA(nn.Module):
             mask &= (q_pos - k_pos) < self.sliding_window
         scores = scores.masked_fill(~mask[None, None, :, :], float("-inf"))
 
-        sink = self.sinks.view(1, self.n_heads, 1, 1)
+        # Per-head sink logits must broadcast to the [b, h, n, total] score
+        # tensor; a bare [1, h, 1, 1] sink cannot concatenate with a batch > 1.
+        sink = self.sinks.view(1, self.n_heads, 1, 1).expand(b, self.n_heads, n, 1)
         attn = F.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :-1]
         out = (attn @ v).transpose(1, 2).contiguous().view(b, n, self.n_heads * self.head_dim)
         return self.w_o(out), new_cache
@@ -356,7 +375,7 @@ class WYHouseholderMemory(nn.Module):
 
             # Compact-WY reflection step on row 0 (Day-5 regime).
             u1 = k1t
-            u2 = k2
+            u2 = k2[:, t]
             b1v = torch.clamp(b1, 1.6, 1.9)
             b2v = torch.clamp(betas[:, t, 1] if betas.dim() == 3 else betas[:, t], 1.6, 1.9)
             dot12 = (u1 * u2).sum(dim=-1, keepdim=True)
@@ -421,17 +440,28 @@ class SubspaceLatentMoE(nn.Module):
         self.experts = nn.ModuleList([SwiGLU(d_lat, d_ff, d_lat) for _ in range(n_groups * experts_per_group)])
 
     def retract_stiefel(self):
+        """Joint QR retraction of all group projections onto (column) Stiefel.
+
+        The up-projections [d_lat, d] are stacked along the *column* axis into
+        W in [d, G*d_lat]; QR then yields orthonormal columns Q and each group
+        takes a contiguous block. Stacking along dim=0 instead (the Day-6 bug)
+        produced a [G*d_lat, d] matrix with G*d_lat > d, so full orthonormality
+        was mathematically impossible (P0-07).
+        """
         with torch.no_grad():
-            U = torch.cat([g.t() for g in self.up_groups], dim=0)  # [G*d_lat, d]
-            U = torch.linalg.qr(U).Q
+            W = torch.cat([g.t() for g in self.up_groups], dim=1)  # [d, G*d_lat]
+            Q = torch.linalg.qr(W).Q  # [d, d] (thin QR)
             dl = self.d_lat
             for g in range(self.G):
-                block = U[g * dl : (g + 1) * dl, :]
-                self.up_groups[g].copy_(block.t())
+                block = Q[:, g * dl : (g + 1) * dl]
                 self.down_groups[g].copy_(block)
+                self.up_groups[g].copy_(block.t())
 
     def orthogonality_error(self) -> torch.Tensor:
-        U = torch.cat([g.t() for g in self.up_groups], dim=0)
+        # U is [G*d_lat, d]: the stacked group up-projections themselves, whose
+        # rows must be orthonormal. Transposing here measured a [G*d, d_lat]
+        # Gram matrix instead and reported a large, meaningless error.
+        U = torch.cat([g for g in self.up_groups], dim=0)
         gram = U @ U.t()
         off = gram - torch.eye(gram.shape[0], device=U.device, dtype=U.dtype)
         return (off * off).sum()
@@ -535,9 +565,9 @@ class CodeJEPAWorkspace(nn.Module):
     def forward(
         self, x: torch.Tensor, r: int = 2, ctx: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        h = x @ self.proj_in + self.hyp_codebook[0]
+        h = self.proj_in(x) + self.hyp_codebook[0]
         ctx = x if ctx is None else ctx
-        cached_kv = [(layer, (ctx @ self.kv).chunk(2, dim=-1)) for layer in self.layers]
+        cached_kv = [(layer, (ctx @ layer.kv).chunk(2, dim=-1)) for layer in self.layers]
         z_exec = torch.zeros_like(h)
         for step in range(min(r, self.r_max)):
             for layer, (k_ctx, v_ctx) in cached_kv:
@@ -545,9 +575,11 @@ class CodeJEPAWorkspace(nn.Module):
             z_exec = 0.5 * z_exec + 0.5 * (h @ self.jepa_exec_head)
         hidden_tok = F.gelu(h @ self.head_w1 + self.head_b1)
         p_pass_tok = torch.sigmoid(hidden_tok @ self.head_w2 + self.head_b2).squeeze(-1)
-        ws_delta = h @ self.proj_out
+        ws_delta = self.proj_out(h)
         eff_scale = self.scale[0]
-        return x + eff_scale * ws_delta, h, p_pass_tok, h @ self.jepa_loc_head, z_exec
+        # Return the *delta only*: Block.forward already computes x = x + ws_delta,
+        # so returning x + eff_scale * ws_delta double-added the residual (P0-07).
+        return eff_scale * ws_delta, h, p_pass_tok, h @ self.jepa_loc_head, z_exec
 
 
 # --------------------------------------------------------------------------- block
@@ -705,7 +737,10 @@ class Kestrel6(nn.Module):
                     experts_per_group=config.get("experts_per_group", 8),
                     top_groups=config.get("top_groups", 6),
                     top_k_per_group=config.get("top_k_per_group", 1),
-                    use_workspace=config.get("use_workspace", False),
+                    # The recurrent workspace is only wired on the final block:
+                    # stacking it in every block adds uncalibrated residual mass
+                    # and cost without a supervised objective (P0-07).
+                    use_workspace=(config.get("use_workspace", False) and i == self.layers_n - 1),
                     d_w=config.get("d_w", 1024),
                     w_layers=config.get("w_layers", 4),
                     w_ff=config.get("w_ff", 4096),
@@ -800,7 +835,7 @@ class Kestrel6(nn.Module):
     @torch.no_grad()
     def decode_step(self, token_id: torch.Tensor, cache: List[Dict[str, torch.Tensor]], seq_start: int):
         """Decode a single token given the KV cache. Returns (logits, new_cache)."""
-        x = token_id.view(1, 1)
+        x = token_id.view(token_id.shape[0], 1)
         logits, caches = self._forward_with_cache(x, cache=cache, seq_start=seq_start)
         return logits[:, -1, :], caches
 

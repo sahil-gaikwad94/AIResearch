@@ -10,6 +10,21 @@ VEXX masking runs on the *logits* before selection, so a masked token can never
 be sampled regardless of temperature. Inline ``<<expr=...>>`` inside a
 `` thinking`` block is evaluated by the Tier-2 CAS and the result is spliced into
 the stream.
+
+Decoding modes (P0.8) are explicit and opt-in:
+
+*   ``plain`` -- no Python syntax constraints; used for prose, research and
+    general answers.
+*   ``python`` -- syntax-aware code assistance; the lexer is a structural
+    guard but does not hard-block callees absent from a prompt-local symbol
+    table. Final validity is decided by ``ast.parse`` and execution/tests.
+*   ``json``/structured -- schema-specific constraints only when requested.
+*   ``think`` -- protocol-defined control policy from the CRANE phase logic.
+
+The Tier-4 prompt-level answer bypass was removed (P0.6): a rule checker may
+return a diagnostic flag, but it must not fabricate a completed answer on the
+model's behalf. Every result carries provenance saying which component
+produced it.
 """
 
 from __future__ import annotations
@@ -22,6 +37,15 @@ import torch.nn.functional as F
 
 from .model import Kestrel7
 from .tokenizer import BOS, EOS, BPETokenizer
+
+
+# Decoding modes (P0.8). ``python`` is the only mode that applies the
+# code-aware lexer; ``plain`` applies only the control-token policy.
+PLAIN = "plain"
+PYTHON = "python"
+JSON = "json"
+THINK = "think"
+VALID_MODES = {PLAIN, PYTHON, JSON, THINK}
 
 
 def top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -69,16 +93,26 @@ def generate_v7(
     vexx=None,
     add_bos: bool = True,
     seed: Optional[int] = None,
+    mode: str = PLAIN,
+    provenance: Optional[List[str]] = None,
 ) -> str:
-    """Generate a continuation, optionally with VEXX Tier 0/1/2 and Tier 4 guards."""
-    model.eval()
+    """Generate a continuation, optionally with VEXX Tier 0/1/2 masking.
 
-    # Tier 4 fast path: for research/factuality prompts the calibrated answer is
-    # returned directly, because weights are not evidence.
-    if vexx is not None:
-        calibration = vexx.verify_epistemic_calibration(prompt)
-        if calibration is not None:
-            return prompt + "\n" + calibration["explanation"]
+    P0.6: there is no prompt-level answer bypass here. A rule checker may flag a
+    prompt as needing a grounded workflow, but it must not emit a completed
+    natural-language answer on the model's behalf -- that would make the
+    system appear to answer without the model. The result's provenance list
+    records which components actually contributed.
+
+    P0.8: ``mode`` selects the code-aware lexer. Only ``python`` applies the
+    syntax/symbol-table mask; ``plain`` applies only the control-token policy,
+    so prose containing parentheses, dotted names or mathematical notation is
+    never corrupted.
+    """
+    if mode not in VALID_MODES:
+        raise ValueError(f"unknown decoding mode {mode!r}; valid: {sorted(VALID_MODES)}")
+    model.eval()
+    origins: List[str] = ["neural_generation"]
 
     ids = tokenizer.encode(prompt, add_bos=add_bos, add_eos=False)
     if len(ids) == 0:
@@ -86,8 +120,10 @@ def generate_v7(
     # Prefill truncates to the context window. Track the *truncated* length:
     # using the original prompt length as seq_start would place RoPE positions
     # beyond the cached keys and corrupt every later decode step.
+    truncated = False
     if len(ids) > model.max_ctx:
         ids = ids[-model.max_ctx :]
+        truncated = True
     input_ids = torch.tensor([ids], dtype=torch.long)
 
     logits, cache = model.prefill(input_ids)
@@ -108,6 +144,7 @@ def generate_v7(
                 step_logits.detach().cpu().numpy(),
                 cur_text,
                 tokenizer.id_to_token,
+                mode=mode,
                 remaining_token_budget=max_new_tokens - step_idx,
             )
             step_logits = torch.tensor(
@@ -135,6 +172,7 @@ def generate_v7(
             if m_cas:
                 value = vexx.crane_cas_evaluate(m_cas.group(1).strip()) + ">>"
                 if not value.startswith("ERROR"):
+                    origins.append("deterministic_calculation")
                     # The '=' token is already part of ``generated`` but was not
                     # fed to the model. Feed it before the spliced value, or the
                     # cache silently skips a token and every later logit is wrong.
@@ -156,4 +194,9 @@ def generate_v7(
         )
         seq_start += 1
 
-    return prompt + tokenizer.decode(generated)
+    result = prompt + tokenizer.decode(generated)
+    if truncated:
+        origins.append("prompt_truncated")
+    if provenance is not None:
+        provenance.extend(origins)
+    return result

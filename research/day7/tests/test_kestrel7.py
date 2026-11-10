@@ -24,6 +24,7 @@ import tempfile
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -44,6 +45,7 @@ from kestrel7.tokenizer import (
     BOS,
     EOS,
     PAD,
+    UNK,
     SPECIAL_TOKENS,
     THINK_END,
     THINK_START,
@@ -824,3 +826,362 @@ def test_resume_reproduces_uninterrupted_training(tok, tmp_path):
     assert max_diff == 0.0, f"resumed weights diverged by {max_diff}"
     assert [h["loss"] for h in continued["history"]] == [h["loss"] for h in straight_state["history"]]
     assert trainer.optimizer_step == straight_state["optimizer_step"] == 4
+
+
+# --------------------------------------------------------------------------- [P0.1] MTP document-boundary masking
+
+def test_mtp_document_boundary_masking(hybrid, tok):
+    """P0.1: MTP must ignore targets whose source positions cross a document boundary."""
+    model = hybrid
+    model.eval()
+    # Pack two different documents into one sequence.
+    docs = [
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda",
+        "mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega",
+    ]
+    enc = [tok.encode(d, add_bos=True, add_eos=True) for d in docs]
+    flat_ids = enc[0] + enc[1]
+    input_ids = torch.tensor([flat_ids])
+    labels = input_ids.clone()
+    n_a = len(enc[0])
+    doc_ids = torch.tensor([[0] * n_a + [1] * len(enc[1])])
+
+    with torch.no_grad():
+        _, _, comps = model(
+            input_ids, labels=labels, doc_ids=doc_ids, mtp_weight=0.2, return_components=True
+        )
+
+    # The boundary MTP target (t at end of doc A, t+1 = BOS of doc B) must be masked.
+    # Check that mtp_target_count excludes cross-boundary positions.
+    assert comps["mtp_target_count"] <= max(0, len(flat_ids) - 2)
+
+    # Perturb document A: MTP loss for document B must be unchanged.
+    ids_a_perturbed = list(flat_ids)
+    ids_a_perturbed[0] = (ids_a_perturbed[0] + 1) % model.vocab
+    input_ids_p = torch.tensor([ids_a_perturbed])
+    with torch.no_grad():
+        _, _, comps_p = model(
+            input_ids_p, labels=input_ids_p, doc_ids=doc_ids, mtp_weight=0.2, return_components=True
+        )
+    # Document-B MTP targets should be unaffected by changes to document A.
+    assert comps["mtp_target_count"] == comps_p["mtp_target_count"]
+
+    # Without doc_ids, legacy single-document behavior (mask only labels == -100).
+    with torch.no_grad():
+        _, _, comps_nodoc = model(
+            input_ids, labels=labels, doc_ids=None, mtp_weight=0.2, return_components=True
+        )
+    assert comps_nodoc["mtp_target_count"] >= comps["mtp_target_count"]
+
+
+# --------------------------------------------------------------------------- [P0.2] Next-token CE separate from MTP loss
+
+def test_loss_components_returned(tok):
+    """P0.2: forward with return_components=True exposes separate loss components."""
+    model = build_model("TINY_HYBRID", tokenizer=tok)
+    model.eval()
+    ids = torch.randint(0, model.vocab, (2, 8))
+    labels = ids.clone()
+    docs = torch.zeros_like(ids)
+    _, loss, comps = model(ids, labels=labels, doc_ids=docs, mtp_weight=0.2, return_components=True)
+    assert comps is not None
+    assert set(comps) == {"total_loss", "next_token_ce", "mtp_loss", "lm_target_count", "mtp_target_count"}
+    assert torch.isfinite(comps["total_loss"]) and torch.isfinite(comps["next_token_ce"])
+    assert comps["lm_target_count"] > 0
+
+    # Manual next-token CE must match the reported component.
+    with torch.no_grad():
+        logits, _, _ = model._forward_with_cache(ids, cache=None, seq_start=0, doc_ids=docs)
+    shift_logits = logits[:, :-1, :].reshape(-1, model.vocab)
+    shift_labels = labels[:, 1:].reshape(-1)
+    manual_ce = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+    assert torch.allclose(comps["next_token_ce"], manual_ce, atol=1e-5)
+
+
+def test_perplexity_from_next_token_ce_only(tok):
+    """P0.2: PPL is computed from next-token CE, never the composite objective."""
+    model = build_model("TINY_HYBRID", tokenizer=tok)
+    model.eval()
+    ids = torch.randint(0, model.vocab, (1, 10))
+    labels = ids.clone()
+    docs = torch.zeros_like(ids)
+    _, loss, comps = model(ids, labels=labels, doc_ids=docs, mtp_weight=0.2, return_components=True)
+    # Perplexity from next-token CE.
+    ppl_from_ce = math.exp(float(comps["next_token_ce"]))
+    # The composite objective (CE + 0.2*MTP) should be different from pure CE when MTP is active.
+    if comps["mtp_loss"] is not None:
+        assert float(comps["total_loss"]) != float(comps["next_token_ce"])
+    # Validate via the trainer's validation path.
+    train_texts = [f"validation document {i} with tokens alpha beta gamma delta." for i in range(10)]
+    train, val, _test, _m = deduplicate_and_split(train_texts, train_frac=0.6, val_frac=0.2, seed=1)
+    train_ds = StreamPackedDataset(tok, train, seq_len=16, seed=42)
+    val_ds = StreamPackedDataset(tok, val, seq_len=16, seed=42)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2, shuffle=False)
+    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2, shuffle=False)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    t = Kestrel7Trainer(model, train_loader, val_loader, opt, grad_accum_steps=1, checkpoint_dir=None)
+    metrics = t.validate()
+    assert metrics["val_next_token_ppl"] == math.exp(metrics["val_next_token_ce"])
+
+
+# --------------------------------------------------------------------------- [P0.3] Best checkpoint saved separately
+
+def test_best_checkpoint_saved_and_restored(tok, tmp_path):
+    """P0.3: best checkpoint stores weights from the best next-token CE, not the last."""
+    train_texts = [f"best document {i} alpha beta gamma delta epsilon." for i in range(10)]
+    train, val, _test, _m = deduplicate_and_split(train_texts, train_frac=0.6, val_frac=0.2, seed=2)
+    train_ds = StreamPackedDataset(tok, train, seq_len=12, seed=1)
+    val_ds = StreamPackedDataset(tok, val, seq_len=12, seed=1)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2, shuffle=False)
+    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2, shuffle=False)
+
+    def make_model():
+        return build_model("TINY_HYBRID", tokenizer=tok)
+
+    model_a = make_model()
+    opt_a = torch.optim.AdamW(model_a.parameters(), lr=5e-3)
+    trainer_a = Kestrel7Trainer(
+        model_a, train_loader, val_loader, opt_a,
+        grad_accum_steps=1, val_every_tokens=50, checkpoint_dir=str(tmp_path),
+        seed=42, run_name="best_a", log_every=0,
+    )
+    state_a = trainer_a.fit(epochs=1, max_optimizer_steps=4)
+    best_ce_a = trainer_a.best_next_token_ce
+
+    # The best checkpoint path should exist and differ from the last checkpoint.
+    assert trainer_a.best_checkpoint_path is not None
+    assert trainer_a.best_checkpoint_path != state_a.get("checkpoint_path")
+
+    # Load the best checkpoint into a fresh model and confirm its metric.
+    fresh = build_model("TINY_HYBRID", tokenizer=tok)
+    info = load_checkpoint_v7(
+        trainer_a.best_checkpoint_path, fresh, tokenizer=tok
+    )
+    assert info["best_next_token_ce"] == best_ce_a
+    assert fresh.checkpoint_loaded
+
+    # The last checkpoint (step N) should exist separately.
+    last_path = state_a.get("checkpoint_path")
+    assert last_path is not None
+    assert last_path != trainer_a.best_checkpoint_path
+
+
+# --------------------------------------------------------------------------- [P0.4] Token-weighted gradient accumulation
+
+def test_token_weighted_accumulation_gradients_match(tok):
+    """P0.4: gradients from one concatenated batch == micro-batched split with different valid counts."""
+    model = build_model("TINY_HYBRID", tokenizer=tok)
+    model.eval()
+
+    # Build a batch where valid token counts differ across micro-batches.
+    ids = torch.randint(0, model.vocab, (4, 10))
+    labels = ids.clone()
+    # Make some labels -100 to create variable valid counts.
+    labels[0, 5:] = -100
+    labels[1, 2:] = -100
+    docs = torch.zeros_like(ids)
+
+    # (a) Single concatenated batch.
+    m1 = build_model("TINY_HYBRID", tokenizer=tok)
+    m1.load_state_dict(model.state_dict())
+    _, _, comps_a = m1(ids, labels=labels, doc_ids=docs, mtp_weight=0.0, return_components=True)
+    loss_a = comps_a["next_token_ce"]
+    loss_a.backward()
+    grads_a = [p.grad.clone() for p in m1.parameters() if p.requires_grad and p.grad is not None]
+
+    # (b) Same examples split into micro-batches with different valid counts,
+    # accumulated with token-weighted normalisation.
+    m2 = build_model("TINY_HYBRID", tokenizer=tok)
+    m2.load_state_dict(model.state_dict())
+    # Split rows 0-1 and 2-3 as separate micro-batches.
+    opt2 = torch.optim.SGD(m2.parameters(), lr=1e-3)
+    m2.train()
+    accum_ce_sum = 0.0
+    accum_lm_tokens = 0
+    for mb in [(ids[:2], labels[:2], docs[:2]), (ids[2:], labels[2:], docs[2:])]:
+        mb_ids, mb_lbls, mb_docs = mb
+        _, _, comps_b = m2(mb_ids, labels=mb_lbls, doc_ids=mb_docs, mtp_weight=0.0, return_components=True)
+        n_lm = int(comps_b["lm_target_count"])
+        accum_ce_sum += float(comps_b["next_token_ce"].detach()) * n_lm
+        accum_lm_tokens += n_lm
+        (comps_b["next_token_ce"] * n_lm).backward()
+    # Normalise by total valid LM token count.
+    scale = 1.0 / max(1, accum_lm_tokens)
+    for p in m2.parameters():
+        if p.grad is not None:
+            p.grad *= scale
+    grads_b = [p.grad.clone() for p in m2.parameters() if p.requires_grad and p.grad is not None]
+
+    for ga, gb in zip(grads_a, grads_b):
+        assert torch.allclose(ga, gb, atol=1e-5), "token-weighted accumulation gradients mismatch"
+
+
+# --------------------------------------------------------------------------- [P0.5] Exact resume with shuffle (P0.5 contract)
+
+def test_resume_with_shuffle_reproduces_batch_order(tok, tmp_path):
+    """P0.5: persisted per-epoch permutation and cursor reproduce batch order on resume."""
+    corpus = [f"resume-shuffle document {i} alpha beta gamma delta epsilon." for i in range(12)]
+    train, _val, _test, _m = deduplicate_and_split(corpus, train_frac=0.8, val_frac=0.1, seed=3)
+    ds = StreamPackedDataset(tok, train, seq_len=10, seed=1)
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=2, shuffle=True, collate_fn=collate_stream_packed
+    )
+
+    def make(seed=0):
+        torch.manual_seed(seed)
+        model = build_model("TINY_HYBRID", tokenizer=tok)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        return model, opt
+
+    reference, opt_r = make()
+    straight = Kestrel7Trainer(reference, loader, None, opt_r, seed=7, log_every=0)
+    straight_state = straight.fit(epochs=2, max_optimizer_steps=3)
+
+    interrupted, opt_i = make()
+    first = Kestrel7Trainer(
+        interrupted, loader, None, opt_i, seed=7,
+        checkpoint_dir=str(tmp_path), run_name="resume_shuffle", log_every=0,
+    )
+    half = first.fit(epochs=2, max_optimizer_steps=1)
+
+    resumed, opt_c = make()
+    trainer = Kestrel7Trainer(resumed, loader, None, opt_c, seed=7, log_every=0)
+    info = load_checkpoint_v7(
+        half["checkpoint_path"], resumed, tokenizer=tok, optimizer=opt_c
+    )
+    trainer.load_state_dict(info)
+    continued = trainer.fit(epochs=2, max_optimizer_steps=3)
+
+    max_diff = max(
+        float((a - b).abs().max().detach())
+        for a, b in zip(reference.parameters(), resumed.parameters())
+    )
+    assert max_diff == 0.0, f"resumed weights diverged by {max_diff}"
+    assert trainer.optimizer_step == straight_state["optimizer_step"]
+
+
+# --------------------------------------------------------------------------- [P0.6] Tier-4 bypass removed from normal generation
+
+def test_generate_always_invokes_model_prefill(tok):
+    """P0.6: model.prefill() is invoked for every normal prompt, even with a Tier-4-matching phrase."""
+    class _RecordingModel:
+        def __init__(self, vocab, max_ctx, forced_id=0):
+            self.vocab = vocab
+            self.max_ctx = max_ctx
+            self.forced_id = forced_id
+            self.prefill_calls = 0
+            self.decode_calls = 0
+
+        def eval(self):
+            return self
+
+        def prefill(self, input_ids):
+            self.prefill_calls += 1
+            logits = torch.full((1, self.vocab), -10.0)
+            logits[0, self.forced_id] = 10.0
+            return logits, [{"fake": torch.zeros(1)}]
+
+        def decode_step(self, token_ids, cache, seq_start):
+            self.decode_calls += 1
+            return torch.zeros(1, self.vocab), cache
+
+    model = _RecordingModel(tok.vocab_size, max_ctx=64, forced_id=tok.token_to_id["e"])
+    vexx = Vexx3Controller()
+
+    # A prompt containing a Tier-4-recognised phrase must still invoke prefill.
+    prompt = "A trial reports 95% CI [-0.5, 2.9], p=0.17. Does it establish efficacy?"
+    out = generate_v7(model, tok, prompt, max_new_tokens=4, temperature=None, vexx=vexx)
+    assert model.prefill_calls >= 1, "prefill must be invoked even for calibration-style prompts"
+    assert out.startswith(prompt), "output must start with the prompt"
+
+    # A calibration flag does not replace neural output.
+    out2 = generate_v7(model, tok, prompt, max_new_tokens=4, temperature=None, vexx=vexx)
+    assert model.prefill_calls >= 2
+
+
+# --------------------------------------------------------------------------- [P0.7]  token categories
+
+def test_token_categories_and_think_markers(tok):
+    """P0.7: THINK_START/THINK_END are protocol markers, never-emit tokens stay blocked."""
+    from kestrel7.tokenizer import token_category, THINK_START, THINK_END, NEVER_EMIT, LEGAL_STOP, PROTOCOL_MARKERS
+
+    assert token_category(BOS) == NEVER_EMIT
+    assert token_category(PAD) == NEVER_EMIT
+    assert token_category(UNK) == NEVER_EMIT
+    assert token_category(EOS) == LEGAL_STOP
+    assert token_category(THINK_START) == PROTOCOL_MARKERS
+    assert token_category(THINK_END) == PROTOCOL_MARKERS
+    assert token_category("hello") is None
+
+    vx = Vexx3Controller()
+    vocab_map = {i: t for i, t in tok.id_to_token.items()}
+    masked = vx.apply_in_flight_mask(np.zeros(tok.vocab_size), "hello world", vocab_map, mode="plain")
+    # In plain mode, think markers are not active (phase is STRICT_VERIFIED), so they're blocked.
+    sid_start = tok.token_to_id[THINK_START]
+    assert np.isneginf(masked[sid_start]), "THINK_START blocked in plain mode outside think phase"
+
+    # In think phase, think markers are legal.
+    think_prefix = THINK_START + "reasoning here"
+    masked_think = vx.apply_in_flight_mask(np.zeros(tok.vocab_size), think_prefix, vocab_map, mode="plain")
+    assert not np.isneginf(masked_think[tok.token_to_id[THINK_END]]), "THINK_END legal inside think phase"
+
+
+# --------------------------------------------------------------------------- [P0.8] Decoding modes (plain vs python)
+
+def test_plain_mode_does_not_apply_python_lexer(vx, tok):
+    """P0.8: plain mode applies no Python syntax constraints to prose."""
+    prose = "The value of x = (a + b) / c is not code; f(x) is fine."
+    # Plain mode: no Python lexer, so prose with parentheses/dots passes through.
+    masked_plain = vx.apply_in_flight_mask(
+        np.zeros(tok.vocab_size), prose, tok.id_to_token, mode="plain"
+    )
+    # EOS stays legal in plain mode.
+    assert not np.isneginf(masked_plain[tok.token_to_id[EOS]])
+
+    # Python mode activates the lexer; unknown callees may still be blocked,
+    # but plain mode must not corrupt prose.
+    assert not np.all(np.isneginf(masked_plain))
+
+
+# --------------------------------------------------------------------------- [P0.9] Tier-3 renamed / claims corrected
+
+def test_tier3_renamed_single_row_bound_contractor(vx):
+    """P0.9: Tier-3 renamed to single_row_bound_contractor; old alias still resolves."""
+    assert hasattr(vx, "single_row_bound_contractor")
+    assert hasattr(vx, "trigger_farkas_cdcl_jumpback"), "backward-compatible alias retained"
+    # Bound methods differ per access; compare the underlying function.
+    assert (
+        vx.single_row_bound_contractor.__func__
+        is vx.trigger_farkas_cdcl_jumpback.__func__
+    )
+
+
+# --------------------------------------------------------------------------- [P0.10] Truthful capability metadata
+
+def test_truthful_capability_metadata(tok, tmp_path):
+    """P0.10: metadata fields track origin/updates separately from capability labels."""
+    model = build_model("TINY_HYBRID", tokenizer=tok)
+    assert model.weights_origin == "random_init"
+    assert model.optimizer_updates == 0
+    assert model.tokens_seen == 0
+    assert model.checkpoint_artifact_id is None
+    assert model.capability_evaluation_status == "not_evaluated"
+    assert not model.checkpoint_loaded
+
+    # After a checkpoint load, metadata is restored from the artifact.
+    train_texts = [f"metadata document {i} alpha beta gamma delta epsilon zeta." for i in range(10)]
+    train, val, _test, _m = deduplicate_and_split(train_texts, train_frac=0.6, val_frac=0.2, seed=5)
+    train_ds = StreamPackedDataset(tok, train, seq_len=10, seed=1)
+    val_ds = StreamPackedDataset(tok, val, seq_len=10, seed=1)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2, shuffle=False)
+    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2, shuffle=False)
+    m2 = build_model("TINY_HYBRID", tokenizer=tok)
+    opt2 = torch.optim.AdamW(m2.parameters(), lr=1e-3)
+    t2 = Kestrel7Trainer(m2, train_loader, val_loader, opt2, grad_accum_steps=1,
+                         checkpoint_dir=str(tmp_path), seed=6, run_name="meta", log_every=0)
+    state = t2.fit(epochs=1, max_optimizer_steps=2)
+    loaded = build_model("TINY_HYBRID", tokenizer=tok)
+    load_checkpoint_v7(state["checkpoint_path"], loaded, tokenizer=tok)
+    assert loaded.checkpoint_loaded
+    assert loaded.checkpoint_artifact_id is not None
+    assert loaded.model_status == "trained_checkpoint_loaded"

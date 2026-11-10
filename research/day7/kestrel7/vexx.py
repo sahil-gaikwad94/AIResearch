@@ -3,7 +3,7 @@
 Each tier exists because a cheaper alternative measurably failed:
 
 *   **Tier 0 — CRANE dual phase + SWYB lookahead.** Free-form reasoning inside
-    `` thinking...</think>``, strict checking afterwards. Beat: regex-masking every
+    ``think_start...think_end``, strict checking afterwards. Beat: regex-masking every
     token from step 0, which costs up to ~10 points of reasoning accuracy
     (CRANE, ICML 2025). SWYB masks new opening delimiters when the remaining
     budget cannot close them. Falsifier: unconstrained thinking failing to
@@ -12,18 +12,25 @@ Each tier exists because a cheaper alternative measurably failed:
     regex-only brace counting, which is fooled by triple quotes, raw strings,
     f-string holes, comments, and spoofed receivers. Falsifier: a string-smuggled
     ``)`` being accepted, or ``evil_obj.fn`` bypassing the arity check.
+    The lexer is opt-in: it runs only in explicit ``python`` decoding mode, not
+    on prose (P0.8).
 *   **Tier 2 — SymPy CAS splice.** Beat: float evaluation of ``<<expr=...>>``,
     which loses exactness on fractions and cannot do symbolic cancellation.
     Falsifier: ``(5/6 - 1/4)/(7/12)`` not returning exactly ``1``.
-*   **Tier 3 — exact-rational Farkas cut + hybrid CDCL jumpback.** Bounds are
-    Fractions widened outward by one ULP (``math.nextafter``) so a cut can never
-    exclude the true optimum. Rewinds *both* full-attention KV caches and Gated
-    DeltaNet states. Beat: float cuts, which are unsound at small scales.
-    Falsifier: a widened bound excluding a feasible point.
+*   **Tier 3 — single-row bound contractor.** This is a *prototype* bound
+    contractor, not a general Farkas certificate and not a complete CDCL theory
+    solver. Given one row ``a_c x_c + sum_j a_j x_j <= rhs`` it derives one bound
+    for ``x_c`` along the current assignment slice, widens it outward by one
+    ULP, and rewinds the hybrid cache to the culprit checkpoint. It is renamed
+    from the earlier "Farkas cut" wording (P0.9) and is disabled by default in
+    general reasoning. Falsifier: a widened bound excluding a feasible point.
 *   **Tier 4 — epistemic calibration.** Beat: answering unverified premises.
-    Falsifier: a non-significant CI reported as established.
+    Falsifier: a non-significant CI reported as established. The prompt-level
+    answer bypass was removed (P0.6): this tier may flag a prompt, but it must
+    not fabricate a completed answer on the model's behalf.
 *   **Tier 5 — AST-sanitized sandbox + DPO collector.** Beat: ``exec`` of
     untrusted text. Falsifier: an import or file access reaching the interpreter.
+    Process isolation with resource limits, not a hardened container.
 """
 
 from __future__ import annotations
@@ -43,9 +50,36 @@ import sympy as sp
 import torch
 
 from .model import clone_hybrid_cache
-from .tokenizer import EOS, SPECIAL_TOKENS, THINK_END, THINK_START
+from .tokenizer import (
+    EOS,
+    SPECIAL_TOKENS,
+    THINK_END,
+    THINK_START,
+    token_category,
+    NEVER_EMIT,
+    LEGAL_STOP,
+    PROTOCOL_MARKERS,
+)
 
 __all__ = ["Vexx3Controller"]
+
+
+# --------------------------------------------------------------------------- token categories
+#
+# P0.7: the tokenizer declares THINK_START and THINK_END as special tokens,
+# but the old in-flight mask looped over ALL SPECIAL_TOKENS and masked every
+# special token except EOS -- including the think markers the controller's phase
+# logic expects to see. That is an internal protocol contradiction. The
+# categories below make the policy explicit instead of implicit.
+
+# Tokens that must never be emitted mid-answer (they would be stripped by
+# decode() or produce nonsense).
+NEVER_EMIT = "never_emit"
+# Tokens that legally terminate generation.
+LEGAL_STOP = "legal_stop"
+# Protocol markers (think delimiters) that are legal only when the generation
+# protocol expects them; the controller tracks this from generated token IDs.
+PROTOCOL_MARKERS = "protocol_markers"
 
 
 # --------------------------------------------------------------------------- isolated worker
@@ -366,27 +400,51 @@ class Vexx3Controller:
         vocab_map: Dict[int, str],
         expected_return_type: Optional[str] = None,
         remaining_token_budget: int = 256,
+        mode: str = "python",
     ) -> np.ndarray:
-        """Tier 0 + Tier 1 mask: -inf on every disallowed next token."""
+        """Tier 0 + Tier 1 mask: -inf on every disallowed next token.
+
+        P0.7: token policy is driven by explicit categories (never-emit,
+        legal-stop, protocol-markers) rather than "mask every special token
+        except EOS", which silenced the think markers the phase logic needs.
+
+        P0.8: the Python syntax lexer is active only in ``python`` mode. In
+        ``plain`` mode only the control-token policy applies, so prose with
+        parentheses, dotted names or mathematical notation is never corrupted.
+        """
         if logits.ndim != 1:
             raise ValueError(f"logits must be 1-D [vocab], got shape {tuple(logits.shape)}")
         masked = np.array(logits, dtype=np.float64, copy=True)
 
-        # Invisible control tokens would be stripped by decode(); emitting
-        # PAD/BOS/UNK mid-answer silently deletes text. EOS stays legal so the
-        # model can stop. This applies in *both* phases: free reasoning is not a
-        # licence to emit control tokens.
+        # Control-token policy (both phases, all modes). Never-emit tokens are masked
+# everywhere; protocol markers are handled just after this loop so they are
+# blocked regardless of decoding mode (P0.7/P0.8).
         for tid, tok_str in vocab_map.items():
             if tid < 0 or tid >= masked.shape[-1]:
                 raise ValueError(
                     f"vocabulary id {tid} is outside the logit vector (size {masked.shape[-1]})"
                 )
-            if tok_str in SPECIAL_TOKENS and tok_str != EOS:
+            cat = token_category(tok_str)
+            if cat == NEVER_EMIT:
                 masked[tid] = -np.inf
 
         phase = self.crane_phase(prefix_text)
+
+        # Protocol markers: blocked unless the phase explicitly allows them.
+        for tid, tok_str in vocab_map.items():
+            cat = token_category(tok_str)
+            if cat != PROTOCOL_MARKERS:
+                continue
+            if phase == "UNCONSTRAINED_THINK" and tok_str == THINK_END:
+                continue  # legal to exit think
+            masked[tid] = -np.inf
+
         if phase == "UNCONSTRAINED_THINK" and remaining_token_budget > 4:
             return masked  # CRANE: free exploration during reasoning
+
+        # P0.8: the code-aware lexer is opt-in.
+        if mode != "python":
+            return masked
 
         live_syms = dict(self.symbol_table)
         live_syms.update(self.extract_ast_symbol_table(prefix_text))
@@ -394,9 +452,10 @@ class Vexx3Controller:
         open_depth = len(base_state.get("stack", []))
 
         for tid, tok_str in vocab_map.items():
-            # Control tokens were already masked above, in both phases.
-            if tok_str in SPECIAL_TOKENS and tok_str != EOS:
+            cat = token_category(tok_str)
+            if cat == NEVER_EMIT:
                 continue
+            # Protocol markers already handled above (mode-independent).
 
             # SWYB distance-to-acceptance: no new nesting we cannot close.
             if remaining_token_budget <= open_depth + 1 and any(c in tok_str for c in "([{"):
@@ -563,7 +622,7 @@ class Vexx3Controller:
             }
         )
 
-    def trigger_farkas_cdcl_jumpback(
+    def single_row_bound_contractor(
         self,
         conflict_vars: set,
         constraint: Dict[str, Any],
@@ -575,7 +634,8 @@ class Vexx3Controller:
         contractor for a single row ``a_c x_c + sum_j a_j x_j <= rhs``. It is
         *not* a general Farkas certificate engine and not a complete CDCL linear
         theory; it derives one bound, widens it outward by one ULP, and rewinds
-        the hybrid cache to the culprit checkpoint.
+        the hybrid cache to the culprit checkpoint. It is disabled by default
+        in general reasoning (P0.9).
         """
         candidates = [cp for cp in self.checkpoints if cp["var"] in conflict_vars]
         if not candidates:
@@ -623,6 +683,10 @@ class Vexx3Controller:
 
         self.checkpoints = [cp for cp in self.checkpoints if cp["token_idx"] <= tok_idx]
         return tok_idx, rewound_cache, self.bounds[c_var]
+
+    # Backward-compatible alias (P0.9). The public name now documents the true
+    # scope; old callers and the regression fixture still resolve here.
+    trigger_farkas_cdcl_jumpback = single_row_bound_contractor
 
     # ==================================================================
     # Tier 4: epistemic calibration & evidence guard

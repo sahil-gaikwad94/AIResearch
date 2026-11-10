@@ -32,10 +32,36 @@ BOS = "<|bos|>"
 EOS = "<|eos|>"
 PAD = "<|pad|>"
 UNK = "<|unk|>"
-THINK_START = "<think>"
-THINK_END = "</think>"
+THINK_START = "think_start"
+THINK_END = "think_end"
 
 SPECIAL_TOKENS = [BOS, EOS, PAD, UNK, THINK_START, THINK_END]
+
+# P0.7: explicit token categories. The old code masked every special token
+# except EOS, which silenced the think markers the controller's phase logic
+# depends on -- an internal protocol contradiction. These categories make
+# the policy explicit and testable.
+NEVER_EMIT = "never_emit"
+LEGAL_STOP = "legal_stop"
+PROTOCOL_MARKERS = "protocol_markers"
+
+_TOKEN_CATEGORY = {
+    BOS: NEVER_EMIT,
+    PAD: NEVER_EMIT,
+    UNK: NEVER_EMIT,
+    EOS: LEGAL_STOP,
+    THINK_START: PROTOCOL_MARKERS,
+    THINK_END: PROTOCOL_MARKERS,
+}
+
+
+def token_category(token_str: str) -> Optional[str]:
+    """Classify a token string for the generation protocol.
+
+    Returns ``NEVER_EMIT``, ``LEGAL_STOP`` or ``PROTOCOL_MARKERS`` for special
+    tokens, or ``None`` for ordinary text tokens.
+    """
+    return _TOKEN_CATEGORY.get(token_str)
 
 # GPT-2-style pre-tokenizer: contractions, words, numbers, punctuation, spaces.
 _PAT = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+(?!\S)|\s+")

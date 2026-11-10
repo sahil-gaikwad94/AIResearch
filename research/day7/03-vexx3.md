@@ -55,50 +55,36 @@ subscript, comprehension, or lambda; the regression test submits all of those pl
 `(5/6 - 1/4) / (7/12)`, cannot cancel `x + x - x`, and cannot distinguish a symbolic `x` from a
 number. **Falsifier:** any of the benchmark's exact-answer items differing from the closed form.
 
-## Tier 3 — exact Farkas cut + hybrid jumpback
+## Tier 3 — single-row bound contractor
 
-Given `a_c x_c + Σ_{j≠c} a_j x_j ≤ rhs`, the routine derives one bound
+This is a *prototype* bound contractor, **not** a general Farkas certificate and **not**
+a complete CDCL theory solver. Given one row ``a_c x_c + Σ_{j≠c} a_j x_j ≤ rhs`` it derives
+one bound for ``x_c`` along the current assignment slice, widens it outward by one ULP with
+``math.nextafter``, and rewinds the hybrid cache to the culprit checkpoint. It is disabled by
+default in general reasoning. **Falsifier:** a widened bound excluding a feasible point. The
+test asserts the exact Fraction, the outward direction, and that the GDN state survives the
+rewind unchanged. This tier does not implement general Farkas certificates or a complete linear
+CDCL theory.
 
-```
-x_c ≤ (rhs − Σ_{j≠c} a_j x_j*) / a_c        (or ≥ when a_c < 0)
-```
+## Tier 4 — epistemic calibration (demoted to regression fixture)
 
-computed in `fractions.Fraction`, then widened *outward* by one ULP with `math.nextafter`. The
-`x_j*` are the **current assignment values**, so this is a bound along the current assignment
-slice, not a globally valid Farkas cut and not an infeasibility certificate. The culprit is the
-highest-entropy decision variable in the conflict core; its bounds snapshot is restored, which
-rolls back downstream cube-local cuts.
-
-The jumpback rewinds **both** hybrid cache families simultaneously:
-
-* every full-attention layer's `k`/`v` sliced to `tok_idx`;
-* every Gated DeltaNet layer's `S_t`, which is already fixed-size, plus its conv history.
-
-**Why outward widening:** a cut that is one float too tight is unsound — it can exclude the true
-optimum. `nextafter` buys one representable value of slack and is cheap. **Falsifier:** a widened
-bound excluding a feasible point. The test asserts the exact Fraction, the outward direction, and
-that the GDN state survives the rewind unchanged. It also checks the negative-coefficient branch
-produces a lower bound, not an upper bound. This tier is a **prototype bound contractor**: it does
-not implement general Farkas certificates or a complete linear CDCL theory.
-
-## Tier 4 — epistemic calibration
-
-`verify_epistemic_calibration()` inspects the prompt for:
+``verify_epistemic_calibration()`` inspects the prompt for statistical, temporal, sampling,
+contradiction, and premise traps:
 
 | Trap | Verdict |
 |---|---|
-| 95% CI spanning 0, or `p >= 0.05` | `not established` |
-| Newer dated official notice vs older blog | the newer value (e.g. `8 units`) |
-| Voluntary online poll generalized nationally | `not justified` |
-| Unverified award or entity | `INSUFFICIENT EVIDENCE` |
-| Fictional place | `UNKNOWN` |
-| Table vs paragraph contradiction | `CONFLICT` |
-| `0.999... < 1` premise | `equal` (the premise is false) |
+| 95% CI spanning 0, or ``p >= 0.05`` | ``not established`` |
+| Newer dated official notice vs older blog | the newer value (e.g. ``8 units``) |
+| Voluntary online poll generalized nationally | ``not justified`` |
+| Unverified award or entity | ``INSUFFICIENT EVIDENCE`` |
+| Fictional place | ``UNKNOWN`` |
+| Table vs paragraph contradiction | ``CONFLICT`` |
+| ``0.999... < 1`` premise | ``equal`` (the premise is false) |
 
-Crucially, a genuinely significant result must **not** be flagged: CI `[0.4, 2.1]`, `p = 0.01` is
-accepted. A guard that fires on everything is not a guard. **Alternative rejected:** refusing all
-quantitative claims, which is calibrated but useless. **Falsifier:** a non-significant CI reported
-as established, or a significant one reported as not established.
+The Tier-4 prompt-level **answer bypass was removed** from normal generation (P0.6): a rule
+checker may flag a prompt as needing a grounded workflow, but it must not fabricate a completed
+natural-language answer on the model's behalf. Tier-4 patterns are kept only as regression
+fixtures. The normal factuality pipeline inspects actual generated claims and their evidence.
 
 ## Tier 5 — sanitized execution + DPO collector
 

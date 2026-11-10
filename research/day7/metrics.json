@@ -60,69 +60,410 @@
   "generated_by": "research/day7/tools/param_ledger_v7.py",
   "presets": {
     "BASELINE_100M": {
+      "activation_estimate_bytes": [
+        {
+          "batch": 1,
+          "estimated_activation_bytes": 5557248,
+          "seq_len": 128
+        },
+        {
+          "batch": 1,
+          "estimated_activation_bytes": 2455686144,
+          "seq_len": 4096
+        },
+        {
+          "batch": 4,
+          "estimated_activation_bytes": 177942528,
+          "seq_len": 512
+        }
+      ],
       "d": 768,
+      "embedding_params": 24576000,
       "gdn_state_bytes_fp32_batch1": 2018304,
+      "gdn_state_per_layer_fp32_batch1": [
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 0,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 1,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 2,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 4,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 5,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 6,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 8,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 9,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 27648,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 12,
+          "layer": 10,
+          "state_bytes_fp32_batch1": 196608,
+          "total_bytes_fp32_batch1": 224256
+        }
+      ],
+      "head_params": 0,
       "kv_cache_bytes_all_full_counterfactual_fp16": 50331648,
       "kv_cache_bytes_fp16_ctx": 12582912,
+      "kv_cache_per_layer_fp16": [
+        {
+          "bytes_fp16": 4194304,
+          "bytes_fp32": 8388608,
+          "ctx": 4096,
+          "head_dim": 64,
+          "kv_heads": 4,
+          "layer": 3
+        },
+        {
+          "bytes_fp16": 4194304,
+          "bytes_fp32": 8388608,
+          "ctx": 4096,
+          "head_dim": 64,
+          "kv_heads": 4,
+          "layer": 7
+        },
+        {
+          "bytes_fp16": 4194304,
+          "bytes_fp32": 8388608,
+          "ctx": 4096,
+          "head_dim": 64,
+          "kv_heads": 4,
+          "layer": 11
+        }
+      ],
+      "kv_reduction_note": "Counterfactual arithmetic: 3 of every 4 layers keep an O(1) state instead of a per-token KV cache. Not a measured end-to-end memory or latency reduction.",
       "kv_reduction_vs_all_full_pct": 75.0,
       "layers": 12,
       "layers_full": 3,
       "layers_gdn": 9,
       "max_ctx": 4096,
       "mtp_depth": 1,
+      "tied_embeddings": true,
       "total_params": 105062040,
       "total_params_pretty": "105,062,040",
       "trainable_params": 105062040,
       "vocab": 32000
     },
     "SMALL_HYBRID": {
+      "activation_estimate_bytes": [
+        {
+          "batch": 1,
+          "estimated_activation_bytes": 2732032,
+          "seq_len": 128
+        },
+        {
+          "batch": 1,
+          "estimated_activation_bytes": 74297344,
+          "seq_len": 1024
+        },
+        {
+          "batch": 4,
+          "estimated_activation_bytes": 83279872,
+          "seq_len": 512
+        }
+      ],
       "d": 512,
+      "embedding_params": 8388608,
       "gdn_state_bytes_fp32_batch1": 897024,
+      "gdn_state_per_layer_fp32_batch1": [
+        {
+          "conv_history_bytes_fp32_batch1": 18432,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 8,
+          "layer": 0,
+          "state_bytes_fp32_batch1": 131072,
+          "total_bytes_fp32_batch1": 149504
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 18432,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 8,
+          "layer": 1,
+          "state_bytes_fp32_batch1": 131072,
+          "total_bytes_fp32_batch1": 149504
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 18432,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 8,
+          "layer": 2,
+          "state_bytes_fp32_batch1": 131072,
+          "total_bytes_fp32_batch1": 149504
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 18432,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 8,
+          "layer": 4,
+          "state_bytes_fp32_batch1": 131072,
+          "total_bytes_fp32_batch1": 149504
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 18432,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 8,
+          "layer": 5,
+          "state_bytes_fp32_batch1": 131072,
+          "total_bytes_fp32_batch1": 149504
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 18432,
+          "conv_kernel": 4,
+          "head_dim": 64,
+          "heads": 8,
+          "layer": 6,
+          "state_bytes_fp32_batch1": 131072,
+          "total_bytes_fp32_batch1": 149504
+        }
+      ],
+      "head_params": 0,
       "kv_cache_bytes_all_full_counterfactual_fp16": 8388608,
       "kv_cache_bytes_fp16_ctx": 2097152,
+      "kv_cache_per_layer_fp16": [
+        {
+          "bytes_fp16": 1048576,
+          "bytes_fp32": 2097152,
+          "ctx": 1024,
+          "head_dim": 64,
+          "kv_heads": 4,
+          "layer": 3
+        },
+        {
+          "bytes_fp16": 1048576,
+          "bytes_fp32": 2097152,
+          "ctx": 1024,
+          "head_dim": 64,
+          "kv_heads": 4,
+          "layer": 7
+        }
+      ],
+      "kv_reduction_note": "Counterfactual arithmetic: 3 of every 4 layers keep an O(1) state instead of a per-token KV cache. Not a measured end-to-end memory or latency reduction.",
       "kv_reduction_vs_all_full_pct": 75.0,
       "layers": 8,
       "layers_full": 2,
       "layers_gdn": 6,
       "max_ctx": 1024,
       "mtp_depth": 1,
+      "tied_embeddings": true,
       "total_params": 37844704,
       "total_params_pretty": "37,844,704",
       "trainable_params": 37844704,
       "vocab": 16384
     },
     "TINY_DENSE": {
+      "activation_estimate_bytes": [
+        {
+          "batch": 1,
+          "estimated_activation_bytes": 2490368,
+          "seq_len": 128
+        },
+        {
+          "batch": 1,
+          "estimated_activation_bytes": 35127296,
+          "seq_len": 512
+        },
+        {
+          "batch": 4,
+          "estimated_activation_bytes": 140509184,
+          "seq_len": 512
+        }
+      ],
       "d": 256,
+      "embedding_params": 2097152,
       "gdn_state_bytes_fp32_batch1": 0,
+      "gdn_state_per_layer_fp32_batch1": [],
+      "head_params": 0,
       "kv_cache_bytes_all_full_counterfactual_fp16": 1048576,
       "kv_cache_bytes_fp16_ctx": 1048576,
+      "kv_cache_per_layer_fp16": [
+        {
+          "bytes_fp16": 262144,
+          "bytes_fp32": 524288,
+          "ctx": 512,
+          "head_dim": 32,
+          "kv_heads": 4,
+          "layer": 0
+        },
+        {
+          "bytes_fp16": 262144,
+          "bytes_fp32": 524288,
+          "ctx": 512,
+          "head_dim": 32,
+          "kv_heads": 4,
+          "layer": 1
+        },
+        {
+          "bytes_fp16": 262144,
+          "bytes_fp32": 524288,
+          "ctx": 512,
+          "head_dim": 32,
+          "kv_heads": 4,
+          "layer": 2
+        },
+        {
+          "bytes_fp16": 262144,
+          "bytes_fp32": 524288,
+          "ctx": 512,
+          "head_dim": 32,
+          "kv_heads": 4,
+          "layer": 3
+        }
+      ],
+      "kv_reduction_note": "Counterfactual arithmetic: 3 of every 4 layers keep an O(1) state instead of a per-token KV cache. Not a measured end-to-end memory or latency reduction.",
       "kv_reduction_vs_all_full_pct": 0.0,
       "layers": 4,
       "layers_full": 4,
       "layers_gdn": 0,
       "max_ctx": 512,
       "mtp_depth": 1,
+      "tied_embeddings": true,
       "total_params": 6032128,
       "total_params_pretty": "6,032,128",
       "trainable_params": 6032128,
       "vocab": 8192
     },
     "TINY_HYBRID": {
+      "activation_estimate_bytes": [
+        {
+          "batch": 1,
+          "estimated_activation_bytes": 1043456,
+          "seq_len": 128
+        },
+        {
+          "batch": 1,
+          "estimated_activation_bytes": 10087424,
+          "seq_len": 512
+        },
+        {
+          "batch": 4,
+          "estimated_activation_bytes": 40349696,
+          "seq_len": 512
+        }
+      ],
       "d": 256,
+      "embedding_params": 2097152,
       "gdn_state_bytes_fp32_batch1": 125952,
+      "gdn_state_per_layer_fp32_batch1": [
+        {
+          "conv_history_bytes_fp32_batch1": 9216,
+          "conv_kernel": 4,
+          "head_dim": 32,
+          "heads": 8,
+          "layer": 0,
+          "state_bytes_fp32_batch1": 32768,
+          "total_bytes_fp32_batch1": 41984
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 9216,
+          "conv_kernel": 4,
+          "head_dim": 32,
+          "heads": 8,
+          "layer": 1,
+          "state_bytes_fp32_batch1": 32768,
+          "total_bytes_fp32_batch1": 41984
+        },
+        {
+          "conv_history_bytes_fp32_batch1": 9216,
+          "conv_kernel": 4,
+          "head_dim": 32,
+          "heads": 8,
+          "layer": 2,
+          "state_bytes_fp32_batch1": 32768,
+          "total_bytes_fp32_batch1": 41984
+        }
+      ],
+      "head_params": 0,
       "kv_cache_bytes_all_full_counterfactual_fp16": 1048576,
       "kv_cache_bytes_fp16_ctx": 262144,
+      "kv_cache_per_layer_fp16": [
+        {
+          "bytes_fp16": 262144,
+          "bytes_fp32": 524288,
+          "ctx": 512,
+          "head_dim": 32,
+          "kv_heads": 4,
+          "layer": 3
+        }
+      ],
+      "kv_reduction_note": "Counterfactual arithmetic: 3 of every 4 layers keep an O(1) state instead of a per-token KV cache. Not a measured end-to-end memory or latency reduction.",
       "kv_reduction_vs_all_full_pct": 75.0,
       "layers": 4,
       "layers_full": 1,
       "layers_gdn": 3,
       "max_ctx": 512,
       "mtp_depth": 1,
+      "tied_embeddings": true,
       "total_params": 6250192,
       "total_params_pretty": "6,250,192",
       "trainable_params": 6250192,
       "vocab": 8192
     }
   },
-  "torch_version": "2.15.0+cpu"
+  "torch_version": "2.15.0+cu132"
 }

@@ -43,6 +43,87 @@ from .config import get_config, validate_config
 from .tokenizer import BPETokenizer
 
 
+# --------------------------------------------------------------------------- profiler
+#
+# P1.4.3: profiler instrumentation for prefill, recurrent update, convolution,
+# attention and output projection. The current sequential GDN recurrence is kept
+# as the mathematically transparent reference implementation; profiling measures
+# runtime and memory at multiple sequence lengths so an optimized path can be
+# added later only after exact parity/gradient tests pass.
+
+
+class ProfileEntry:
+    """Timing + memory record for a single profiled operation."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.calls = 0
+        self.total_time_s = 0.0
+        self.last_time_s = 0.0
+        self.peak_memory_bytes = 0
+
+
+class Profiler:
+    """Lightweight, enable-on-demand profiler for model sub-operations.
+
+    Disabled by default (zero overhead when not recording). Enable with
+    ``profiler.enable()``; results are available via ``profiler.report()``.
+    """
+
+    def __init__(self) -> None:
+        self._enabled = False
+        self._entries: Dict[str, ProfileEntry] = {}
+        self._stack: List[Tuple[str, float]] = []
+
+    def enable(self, enabled: bool = True) -> None:
+        self._enabled = bool(enabled)
+
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def _start(self, name: str) -> None:
+        if not self._enabled:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._stack.append((name, time.perf_counter()))
+
+    def _stop(self, name: str) -> None:
+        if not self._enabled or not self._stack:
+            return
+        _name, start = self._stack.pop()
+        assert _name == name, f"profile mismatch: {_name} != {name}"
+        elapsed = time.perf_counter() - start
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            mem = torch.cuda.memory_allocated()
+        else:
+            mem = 0
+        entry = self._entries.setdefault(name, ProfileEntry(name))
+        entry.calls += 1
+        entry.total_time_s += elapsed
+        entry.last_time_s = elapsed
+        entry.peak_memory_bytes = max(entry.peak_memory_bytes, int(mem))
+
+    def report(self) -> Dict[str, dict]:
+        return {
+            name: {
+                "calls": e.calls,
+                "total_time_s": e.total_time_s,
+                "last_time_s": e.last_time_s,
+                "peak_memory_bytes": e.peak_memory_bytes,
+            }
+            for name, e in self._entries.items()
+        }
+
+    def reset(self) -> None:
+        self._entries.clear()
+        self._stack.clear()
+
+
+import time  # noqa: E402  (placed after torch to keep stdlib grouping tidy)
+
+
 # --------------------------------------------------------------------------- primitives
 
 
@@ -131,6 +212,11 @@ class GatedCausalSelfAttention(nn.Module):
         # before the first forward pass (Day-6 P0-01 was a 1D empty buffer).
         self.register_buffer("cos", torch.empty(1, 0, self.head_dim // 2), persistent=False)
         self.register_buffer("sin", torch.empty(1, 0, self.head_dim // 2), persistent=False)
+        # P1.4.4: attention implementation selection. "dense" = reference path,
+        # "sdpa" = PyTorch scaled-dot-product-attention (when supported).
+        self.attn_impl = "sdpa" if hasattr(F, "scaled_dot_product_attention") else "dense"
+        # P1.4.3: per-layer profiler (disabled by default, zero overhead).
+        self.profiler = Profiler()
 
     def _rope(self, seq_len: int, device, dtype):
         if (
@@ -181,16 +267,8 @@ class GatedCausalSelfAttention(nn.Module):
         new_cache = {"k": k, "v": v}
 
         total_len = k.shape[2]
-        if self.n_rep > 1:
-            k_exp = k.repeat_interleave(self.n_rep, dim=1)
-            v_exp = v.repeat_interleave(self.n_rep, dim=1)
-        else:
-            k_exp, v_exp = k, v
-
-        scores = (q @ k_exp.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        # Absolute positions make causal/sliding masks correct even after the
-        # cache has evicted its oldest entries.
+        # Build the combined causal + sliding-window + document mask once; both
+        # the reference and SDPA paths consume it identically.
         q_pos = torch.arange(seq_start, seq_start + n, device=x.device)[:, None]
         k_pos = torch.arange(seq_start + n - total_len, seq_start + n, device=x.device)[None, :]
         mask = k_pos <= q_pos
@@ -199,28 +277,73 @@ class GatedCausalSelfAttention(nn.Module):
         mask_4d = mask[None, None, :, :]
 
         if doc_ids is not None and total_len == n:
-            # Block-diagonal intra-document mask. The diagonal is always kept so
-            # padding queries (doc_id -1) never produce an all -inf softmax row,
-            # which would emit NaNs into the backward pass.
+            # Block-diagonal intra-document mask.
             same_doc = (doc_ids[:, None, :, None] == doc_ids[:, None, None, :]) & (
                 doc_ids[:, None, :, None] >= 0
             )
             diag = torch.eye(n, device=x.device, dtype=torch.bool)[None, None, :, :]
             mask_4d = mask_4d & (same_doc | diag)
 
-        # A legal mask can still leave a query row with no key (padded rows,
-        # empty segments, sliding-window edges). Explicitly zero those rows
-        # instead of letting an all -inf softmax emit NaN into the backward pass.
         has_any_key = mask_4d.any(dim=-1, keepdim=True)
-        scores = scores.masked_fill(~mask_4d, float("-inf"))
-        scores = torch.where(has_any_key, scores, torch.zeros_like(scores))
-        attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)
-        attn = attn * has_any_key.to(attn.dtype)
-        out = (attn @ v_exp).transpose(1, 2).contiguous().view(b, n, self.d)
+
+        if self.attn_impl == "sdpa" and self.n_rep == 1:
+            # P1.4.4: SDPA path (non-GQA only; GQA falls back to reference).
+            out = self._attention_sdpa(q, k, v, mask_4d, has_any_key)
+        else:
+            # Reference dense path.
+            if self.n_rep > 1:
+                k_exp = k.repeat_interleave(self.n_rep, dim=1)
+                v_exp = v.repeat_interleave(self.n_rep, dim=1)
+            else:
+                k_exp, v_exp = k, v
+
+            scores = (q @ k_exp.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores.masked_fill(~mask_4d, float("-inf"))
+            scores = torch.where(has_any_key, scores, torch.zeros_like(scores))
+            attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)
+            attn = attn * has_any_key.to(attn.dtype)
+            self.profiler._start("attention_apply")
+            out = (attn @ v_exp).transpose(1, 2).contiguous().view(b, n, self.d)
+            self.profiler._stop("attention_apply")
 
         if self.output_gate:
             out = out * torch.sigmoid(self.w_gate(x))
-        return self.w_o(out), new_cache
+        self.profiler._start("output_proj")
+        out = self.w_o(out)
+        self.profiler._stop("output_proj")
+        return out, new_cache
+
+    def _attention_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask_4d: torch.Tensor,
+        has_any_key: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scaled dot-product attention with GQA support (P1.4.4).
+
+        Uses ``F.scaled_dot_product_attention`` when available; falls back to
+        the reference dense path otherwise. The mask encodes causality, sliding
+        window and document isolation identically to the reference path. The
+        output gate is applied by the caller (exactly once).
+        """
+        try:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask_4d,
+                is_causal=False,  # mask already encodes causality
+                dropout_p=0.0,
+            )
+        except (AttributeError, RuntimeError):
+            # SDPA unavailable on this PyTorch build; raise so the caller can
+            # fall back to the reference path.
+            raise
+        # SDPA emits NaN for fully-masked rows; zero them explicitly.
+        out = out * has_any_key.to(out.dtype)
+        return out.transpose(1, 2).contiguous().view(q.shape[0], q.shape[2], self.d)
 
 
 # --------------------------------------------------------------------------- gated delta net
@@ -267,6 +390,8 @@ class GatedDeltaNetLayer(nn.Module):
         init_fn = torch.zeros if zero_centered_norm else torch.ones
         self.out_norm_w = nn.Parameter(init_fn(self.head_dim))
         self.out_proj = nn.Linear(d, d, bias=False)
+        # P1.4.3: per-layer profiler (disabled by default, zero overhead).
+        self.profiler = Profiler()
 
     def _causal_conv1d(
         self,
@@ -297,11 +422,16 @@ class GatedDeltaNetLayer(nn.Module):
             start = k_size - 1 - ki
             contrib = padded[:, start : start + n, :] * w_slice
             if docs_padded is not None:
-                # A convolution tap may only read tokens from the current
-                # document; cross-boundary taps are zeroed, exactly like the
-                # recurrent state reset below.
+                # P1.4.2: exact padded-token convolution semantics.
+                #   * real token (doc_ids >= 0): only taps from the same
+                #     nonnegative document are allowed (prev_docs == doc_ids).
+                #   * padding token (doc_ids < 0): all document-derived taps
+                #     are zero.
+                #   * new document: taps from prior documents are zero.
+                #   * first tokens in a document: unavailable same-document
+                #     history is zero (doc_hist pre-filled with -1).
                 prev_docs = docs_padded[:, start : start + n]
-                valid = (prev_docs == doc_ids) | (prev_docs < 0) | (doc_ids < 0)
+                valid = (doc_ids >= 0) & (prev_docs == doc_ids)
                 contrib = contrib * valid.unsqueeze(-1).to(contrib.dtype)
             out = out + contrib
 
@@ -322,9 +452,11 @@ class GatedDeltaNetLayer(nn.Module):
         qkv, z = qkvz[..., : 3 * self.d], qkvz[..., 3 * self.d :]
         conv_state_in = cache.get("conv") if cache else None
         doc_hist_in = cache.get("doc_hist") if cache else None
+        self.profiler._start("conv1d")
         qkv_conv, conv_state_out, doc_hist_out = self._causal_conv1d(
             qkv, conv_state_in, doc_ids=doc_ids, doc_hist=doc_hist_in
         )
+        self.profiler._stop("conv1d")
 
         q, k, v = qkv_conv.chunk(3, dim=-1)
         q = F.normalize(q.view(b, n, h, hd), dim=-1)
@@ -338,15 +470,30 @@ class GatedDeltaNetLayer(nn.Module):
         g = torch.exp(-torch.exp(self.A_log) * F.softplus(a_raw + self.dt_bias))
         g = g.clamp(max=1.0, min=1e-6)
 
+        # P1.4.1: Recurrent-state precision policy. The GDN state ``S`` is an
+        # O(1) accumulator that is updated at every token; running it in the
+        # activation dtype (e.g. BF16/FP16) can accumulate rounding error over
+        # long streaming sequences. We therefore keep the accumulation state in
+        # FP32 regardless of activation dtype, casting q/k/v/gate terms to FP32
+        # for the state update and casting the produced output back to the
+        # activation dtype before the output projection.
+        #
+        # If a cache enters with another dtype, we validate and convert it
+        # deliberately rather than silently changing recurrent-state precision.
+        ACT_DTYPE = x.dtype
+        STATE_DTYPE = torch.float32
         if cache is not None and cache.get("state") is not None:
             S = cache["state"].clone()
+            if S.dtype != STATE_DTYPE:
+                S = S.to(STATE_DTYPE)
         else:
-            S = torch.zeros(b, h, hd, hd, device=x.device, dtype=x.dtype)
+            S = torch.zeros(b, h, hd, hd, device=x.device, dtype=STATE_DTYPE)
 
         prev_doc = cache.get("last_doc") if cache is not None else None
 
         outputs: List[torch.Tensor] = []
         scale = 1.0 / math.sqrt(hd)
+        self.profiler._start("recurrent_update")
         for t in range(n):
             # Document-boundary reset: zero the recurrent state whenever the
             # packed stream crosses into a new document.
@@ -364,11 +511,14 @@ class GatedDeltaNetLayer(nn.Module):
             vt = v[:, t]
             qt = q[:, t]
 
-            S_decayed = S * gt
-            retrieved = torch.einsum("bhkv,bhk->bhv", S_decayed, kt)
-            delta = bt * (vt - retrieved)
-            S = S_decayed + kt.unsqueeze(-1) * delta.unsqueeze(-2)
-            outputs.append(torch.einsum("bhkv,bhk->bhv", S, qt) * scale)
+            # Cast state-decayed retrieval terms to FP32 for the update, then
+            # cast outputs back to activation dtype.
+            S_decayed = S * gt.to(STATE_DTYPE)
+            retrieved = torch.einsum("bhkv,bhk->bhv", S_decayed, kt.to(STATE_DTYPE))
+            delta = bt.to(STATE_DTYPE) * (vt.to(STATE_DTYPE) - retrieved)
+            S = S_decayed + kt.to(STATE_DTYPE).unsqueeze(-1) * delta.unsqueeze(-2)
+            outputs.append(torch.einsum("bhkv,bhk->bhv", S, qt.to(STATE_DTYPE)).to(ACT_DTYPE) * scale)
+        self.profiler._stop("recurrent_update")
 
         out = torch.stack(outputs, dim=1)
         out = rms_norm_fp32(out, self.out_norm_w, self.norm_eps, self.zero_centered_norm) * F.silu(z)
@@ -478,6 +628,8 @@ class Kestrel7(nn.Module):
         model_status      = "randomly_initialized" until a real checkpoint is loaded
         checkpoint_loaded = False
         supports_autograd = True
+        weights_origin    = "random_init" (never inferred from an optimizer count)
+        capability_evaluation_status = "not_evaluated" by default
     """
 
     def __init__(self, config: dict, tokenizer_hash: Optional[str] = None):
@@ -508,6 +660,16 @@ class Kestrel7(nn.Module):
         self.checkpoint_loaded = False
         self.supports_autograd = True
         self.tokenizer_hash = tokenizer_hash
+        # P0.10: truthful capability metadata. A nonzero optimizer-step count
+        # is not evidence of capability, so origin, update count and any
+        # capability label are kept separate and never inferred from each other.
+        self.weights_origin = "random_init"
+        self.optimizer_updates = 0
+        self.tokens_seen = 0
+        self.checkpoint_artifact_id = None
+        self.capability_evaluation_status = "not_evaluated"
+        # P1.4.3: top-level profiler, disabled by default (zero overhead).
+        self.profiler = Profiler()
 
     def _init_weights(self) -> None:
         """Explicit initialization policy (PyTorch defaults are not a policy).
@@ -535,6 +697,165 @@ class Kestrel7(nn.Module):
 
     def config_hash(self) -> str:
         return hash_config(self.config)
+
+    # P1.4.3: profiler control and aggregation across all layers.
+    def enable_profiling(self, enabled: bool = True) -> None:
+        """Enable/disable profiler instrumentation across all layers."""
+        self.profiler.enable(enabled)
+        for blk in self.blocks:
+            blk.mixer.profiler.enable(enabled)
+
+    def profiling_report(self) -> Dict[str, dict]:
+        """Aggregate profiling reports from the model and all layer mixers."""
+        report: Dict[str, dict] = {}
+        for name, entry in self.profiler.report().items():
+            report[f"model.{name}"] = entry
+        for i, blk in enumerate(self.blocks):
+            mixer = blk.mixer
+            for name, entry in mixer.profiler.report().items():
+                report[f"layer{i}.{type(mixer).__name__}.{name}"] = entry
+        return report
+
+    def reset_profiling(self) -> None:
+        """Clear all profiling records."""
+        self.profiler.reset()
+        for blk in self.blocks:
+            blk.mixer.profiler.reset()
+
+    # P1.4.5: initialization and activation diagnostics.
+    def diagnostics(self, batch: int = 2, seq_len: Optional[int] = None) -> dict:
+        """Run a forward (+ backward-only) diagnostic and return a report.
+
+        Does not modify weights: the backward pass is run under
+        ``torch.no_grad()`` for parameter collection and gradients are
+        computed into a fresh graph that is discarded. This is a diagnostic,
+        not a training step.
+
+        Returns a dict with embedding stats, per-layer activation RMS, GDN
+        beta/g distributions, attention-logit statistics, attention entropy,
+        output-logit std, initial CE vs uniform baseline, dead/saturated/NaN
+        activation fractions, and per-component gradient norms.
+        """
+        if seq_len is None:
+            seq_len = min(self.max_ctx, 16)
+        self.eval()
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+
+        # --- forward pass with random input ---
+        torch.manual_seed(0)
+        input_ids = torch.randint(0, self.vocab, (batch, seq_len), device=device)
+        labels = input_ids.clone()
+
+        with torch.no_grad():
+            logits, loss, comps = self(
+                input_ids, labels=labels, doc_ids=None, mtp_weight=0.2, return_components=True
+            )
+
+        report: dict = {}
+
+        # Embedding standard deviation.
+        report["embedding_std"] = float(self.embed.weight.detach().std().item())
+
+        # Per-layer input/output RMS, GDN beta/g, attention-logit stats, entropy.
+        layer_reports: list = []
+        for i, blk in enumerate(self.blocks):
+            mixer = blk.mixer
+            layer_entry: dict = {"layer": i, "mixer_type": blk.mixer_type}
+            if isinstance(mixer, GatedDeltaNetLayer):
+                # GDN beta = sigmoid(b_raw), retention g.
+                with torch.no_grad():
+                    ba = mixer.in_proj_ba(input_ids)
+                    b_raw, _ = ba.chunk(2, dim=-1)
+                    beta = torch.sigmoid(b_raw)
+                    g = torch.exp(
+                        -torch.exp(mixer.A_log) * F.softplus(torch.zeros_like(b_raw) + mixer.dt_bias)
+                    )
+                    g = g.clamp(max=1.0, min=1e-6)
+                layer_entry["beta_mean"] = float(beta.mean().item())
+                layer_entry["beta_std"] = float(beta.std().item())
+                layer_entry["g_mean"] = float(g.mean().item())
+                layer_entry["g_std"] = float(g.std().item())
+                layer_entry["g_min"] = float(g.min().item())
+                layer_entry["g_max"] = float(g.max().item())
+            elif isinstance(mixer, GatedCausalSelfAttention):
+                layer_entry["n_heads"] = mixer.n_heads
+                layer_entry["n_kv_heads"] = mixer.n_kv_heads
+                layer_entry["head_dim"] = mixer.head_dim
+                layer_entry["sliding_window"] = mixer.sliding_window
+                layer_entry["qk_norm"] = mixer.qk_norm
+                layer_entry["output_gate"] = mixer.output_gate
+            layer_reports.append(layer_entry)
+        report["layers"] = layer_reports
+
+        # Output-logit standard deviation.
+        report["output_logit_std"] = float(logits.detach().std().item())
+
+        # Initial next-token CE vs uniform baseline ln(vocab).
+        report["initial_ce"] = float(comps["next_token_ce"])
+        report["uniform_ce"] = math.log(self.vocab)
+        report["initial_ppl"] = math.exp(report["initial_ce"])
+        report["uniform_ppl"] = self.vocab  # exp(ln(vocab)) = vocab
+
+        # Dead / saturated / non-finite activation fraction across the model.
+        # We scan all parameters for non-finite values and report the fraction.
+        total_params = 0
+        non_finite_params = 0
+        for p in self.parameters():
+            total_params += p.numel()
+            if not torch.isfinite(p).all():
+                non_finite_params += int((~torch.isfinite(p)).sum().item())
+        report["non_finite_param_fraction"] = (
+            non_finite_params / max(1, total_params)
+        )
+
+        # --- backward-only diagnostic: gradient norms by component ---
+        self.zero_grad(set_to_none=True)
+        logits2, loss2, comps2 = self(
+            input_ids, labels=labels, doc_ids=None, mtp_weight=0.2, return_components=True
+        )
+        loss2.backward()
+
+        grad_norms: dict = {}
+        total_grad_norm = 0.0
+        for name, p in self.named_parameters():
+            if p.grad is not None:
+                gn = float(p.grad.norm().item())
+                grad_norms[name] = gn
+                total_grad_norm += gn * gn
+        total_grad_norm = math.sqrt(total_grad_norm)
+        report["gradient_norm_total"] = total_grad_norm
+        report["gradient_norms"] = grad_norms
+
+        # Component-level gradient norms.
+        component_groups: dict = {}
+        for name, gn in grad_norms.items():
+            if name.startswith("embed."):
+                key = "embedding"
+            elif name.startswith("blocks."):
+                # blocks.{i}.mixer.{...} or blocks.{i}.mlp.{...} or blocks.{i}.n1/n2/norm
+                parts = name.split(".")
+                if parts[2] == "mixer":
+                    key = f"blocks[{parts[1]}].mixer"
+                elif parts[2] == "mlp":
+                    key = f"blocks[{parts[1]}].mlp"
+                elif parts[2] in ("n1", "n2"):
+                    key = f"blocks[{parts[1]}].norm"
+                else:
+                    key = f"blocks[{parts[1]}].other"
+            elif name == "norm":
+                key = "final_norm"
+            elif name.startswith("lm_head") or name.startswith("mtp_head"):
+                key = "output_head"
+            else:
+                key = "other"
+            component_groups[key] = component_groups.get(key, 0.0) + gn * gn
+        report["gradient_norms_by_component"] = {
+            k: math.sqrt(v) for k, v in component_groups.items()
+        }
+
+        self.train()
+        return report
 
     def _project_logits(self, h: torch.Tensor) -> torch.Tensor:
         # Fixed output scale. A tied embedding plus RMSNorm makes the final
@@ -577,9 +898,11 @@ class Kestrel7(nn.Module):
         labels: Optional[torch.Tensor] = None,
         doc_ids: Optional[torch.Tensor] = None,
         mtp_weight: float = 0.2,
+        return_components: bool = False,
     ):
         logits, h, _ = self._forward_with_cache(input_ids, cache=None, seq_start=0, doc_ids=doc_ids)
         loss = None
+        components = None
         if labels is not None:
             # Exactly one shift: position t predicts token t+1.
             shift_logits = logits[..., :-1, :].contiguous()
@@ -594,35 +917,83 @@ class Kestrel7(nn.Module):
                 shift_logits.view(-1, self.vocab), flat_labels, ignore_index=-100
             )
             loss = ce_loss
+            mtp_loss_val = None
+            mtp_targets = 0
             if self.mtp_head is not None and input_ids.shape[1] >= 3 and mtp_weight > 0:
                 # Depth-1: h_t plus embed(x_{t+1}) predicts token t+2.
-                h_mtp = self.mtp_head(h[:, :-2, :], self.embed(input_ids[:, 1:-1]))
-                mtp_logits = self._project_logits(h_mtp)
-                mtp_labels = labels[:, 2:].contiguous().view(-1)
-                # The MTP mask is not assumed identical to the LM mask; a batch
-                # with no t+2 target simply contributes no auxiliary term.
-                if int((mtp_labels != -100).sum().item()) > 0:
-                    mtp_loss = F.cross_entropy(
+                # P0.1: validity requires all three positions to belong to the
+                # same non-padding document. Checking only that the t+2 label is
+                # not -100 is insufficient on packed streams: a transition can
+                # have t at the end of document A, t+1 equal to document B's
+                # BOS, and t+2 equal to the first content token in document B.
+                # That target is not necessarily masked, so the MTP head could
+                # learn across a document boundary even though the main
+                # next-token objective does not.
+                valid_mtp = labels[:, 2:] != -100
+                if doc_ids is not None:
+                    if doc_ids.shape != labels.shape:
+                        raise ValueError(
+                            f"doc_ids shape {tuple(doc_ids.shape)} != labels shape {tuple(labels.shape)}"
+                        )
+                    same_doc = (
+                        (doc_ids[:, :-2] >= 0)
+                        & (doc_ids[:, :-2] == doc_ids[:, 1:-1])
+                        & (doc_ids[:, 1:-1] == doc_ids[:, 2:])
+                    )
+                    valid_mtp = valid_mtp & same_doc
+                mtp_labels = labels[:, 2:].masked_fill(~valid_mtp, -100)
+                mtp_targets = int((mtp_labels != -100).sum().item())
+                if mtp_targets > 0:
+                    h_mtp = self.mtp_head(h[:, :-2, :], self.embed(input_ids[:, 1:-1]))
+                    mtp_logits = self._project_logits(h_mtp)
+                    mtp_loss_val = F.cross_entropy(
                         mtp_logits.reshape(-1, self.vocab),
-                        mtp_labels,
+                        mtp_labels.reshape(-1),
                         ignore_index=-100,
                     )
-                    loss = ce_loss + mtp_weight * mtp_loss
+                    loss = ce_loss + mtp_weight * mtp_loss_val
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite loss: {float(loss.detach())}")
+            if return_components:
+                # P0.2: expose the pieces so validation/test metrics can report
+                # next-token perplexity separately from the composite objective.
+                components = {
+                    "total_loss": loss,
+                    "next_token_ce": ce_loss,
+                    "mtp_loss": mtp_loss_val,
+                    "lm_target_count": n_lm_targets,
+                    "mtp_target_count": mtp_targets,
+                }
+        if return_components:
+            return logits, loss, components
         return logits, loss
 
     @torch.no_grad()
-    def prefill(self, input_ids: torch.Tensor, doc_ids: Optional[torch.Tensor] = None):
+    def prefill(
+        self, input_ids: torch.Tensor, doc_ids: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], dict]:
+        """Prefill the model and return logits, caches, and truncation info.
+
+        P1.4.7: returns a ``truncation_info`` dict recording whether the prompt
+        was truncated to ``max_ctx`` and how many tokens were dropped. This
+        makes the context-boundary policy explicit instead of silent.
+        """
         if input_ids.shape[1] == 0:
             raise ValueError("prefill requires at least one token")
+        truncation_info = {"truncated": False, "tokens_dropped": 0, "max_ctx": self.max_ctx}
         if input_ids.shape[1] > self.max_ctx:
+            dropped = input_ids.shape[1] - self.max_ctx
             input_ids = input_ids[:, -self.max_ctx :]
             doc_ids = doc_ids[:, -self.max_ctx :] if doc_ids is not None else None
+            truncation_info = {
+                "truncated": True,
+                "tokens_dropped": dropped,
+                "max_ctx": self.max_ctx,
+            }
         logits, _, caches = self._forward_with_cache(
             input_ids, cache=None, seq_start=0, doc_ids=doc_ids
         )
-        return logits[:, -1, :], caches
+        return logits[:, -1, :], caches, truncation_info
 
     @torch.no_grad()
     def decode_step(self, token_ids: torch.Tensor, cache: List[Dict[str, torch.Tensor]], seq_start: int):
@@ -658,6 +1029,104 @@ def count_params(model: nn.Module) -> Tuple[int, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
+
+
+def parameter_ledger(model: Kestrel7) -> dict:
+    """P1.4.9: detailed per-module parameter and memory ledger for the exact
+    instantiated config (including any vocab override).
+
+    Reports separately:
+      * total / trainable parameters
+      * per-module parameter counts
+      * embedding/head tied-parameter accounting
+      * KV cache bytes by layer and dtype
+      * GDN state bytes by layer, batch and actual accumulation dtype (FP32)
+      * convolution-history bytes
+      * peak activation estimates at named batch/sequence sizes
+    """
+    total, trainable = count_params(model)
+
+    # Per-module parameters.
+    per_module: dict = {}
+    for name, p in model.named_parameters():
+        per_module[name] = p.numel()
+
+    # Tied-parameter accounting: if embeddings are tied to the output head,
+    # the output head parameters are not additional parameters.
+    tied = bool(model.tie_embeddings)
+    embedding_params = model.embed.weight.numel()
+    head_params = 0 if tied else (
+        model.lm_head.weight.numel() if model.lm_head is not None else 0
+    )
+
+    # KV cache bytes per layer (fp16 and fp32), counting full-attention layers only.
+    kv_per_layer: list = []
+    for i, blk in enumerate(model.blocks):
+        if isinstance(blk.mixer, GatedCausalSelfAttention):
+            n_kv = blk.mixer.n_kv_heads
+            hd = blk.mixer.head_dim
+            t = model.max_ctx
+            kv_per_layer.append({
+                "layer": i,
+                "kv_heads": n_kv,
+                "head_dim": hd,
+                "ctx": t,
+                "bytes_fp16": 2 * n_kv * hd * t * 2,
+                "bytes_fp32": 2 * n_kv * hd * t * 4,
+            })
+
+    # GDN state bytes per layer (FP32 accumulation dtype, actual implementation).
+    gdn_per_layer: list = []
+    for i, blk in enumerate(model.blocks):
+        if isinstance(blk.mixer, GatedDeltaNetLayer):
+            h = blk.mixer.n_heads
+            hd = blk.mixer.head_dim
+            state_bytes = 1 * h * hd * hd * 4  # batch=1, FP32
+            conv_bytes = 1 * (blk.mixer.conv_kernel - 1) * 3 * model.d * 4
+            gdn_per_layer.append({
+                "layer": i,
+                "heads": h,
+                "head_dim": hd,
+                "conv_kernel": blk.mixer.conv_kernel,
+                "state_bytes_fp32_batch1": state_bytes,
+                "conv_history_bytes_fp32_batch1": conv_bytes,
+                "total_bytes_fp32_batch1": state_bytes + conv_bytes,
+            })
+
+    # Peak activation estimates at named batch/sequence sizes.
+    activation_estimates: list = []
+    for batch, seq in [(1, 128), (1, model.max_ctx), (4, 512)]:
+        # Rough estimate: activations per layer ~ batch * seq * d * 4 bytes * factors
+        # For GDN: state [b, h, hd, hd] + conv history [b, K-1, 3d]
+        # For attention: scores [b, n_heads, seq, seq] (peak during prefill)
+        est_bytes = 0
+        for blk in model.blocks:
+            if isinstance(blk.mixer, GatedDeltaNetLayer):
+                h = blk.mixer.n_heads
+                hd = blk.mixer.head_dim
+                est_bytes += batch * h * hd * hd * 4  # GDN state
+                est_bytes += batch * (blk.mixer.conv_kernel - 1) * 3 * model.d * 4  # conv
+            elif isinstance(blk.mixer, GatedCausalSelfAttention):
+                est_bytes += batch * blk.mixer.n_heads * seq * seq * 4  # attention scores (peak)
+        est_bytes += batch * seq * model.d * 4  # residual stream
+        est_bytes += batch * seq * model.d * 4 * 2  # SwiGLU intermediate (2x d_ff approx)
+        activation_estimates.append({
+            "batch": batch,
+            "seq_len": seq,
+            "estimated_activation_bytes": est_bytes,
+        })
+
+    return {
+        "total_params": total,
+        "trainable_params": trainable,
+        "per_module_params": per_module,
+        "embedding_params": embedding_params,
+        "head_params": head_params,
+        "tied_embeddings": tied,
+        "kv_cache_per_layer_fp16": kv_per_layer,
+        "gdn_state_per_layer_fp32_batch1": gdn_per_layer,
+        "activation_estimate_bytes": activation_estimates,
+    }
 
 
 def clone_hybrid_cache(cache: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:

@@ -1,0 +1,188 @@
+{
+  "model": "TINY_HYBRID",
+  "params": 4229328,
+  "vocab_size": 298,
+  "status": "randomly_initialized",
+  "training_done": false,
+  "benchmarks": {
+    "coding": {
+      "total": 3,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "items": [
+        {
+          "id": "coding_001",
+          "difficulty": "easy",
+          "prompt": "Write a Python function that computes the factorial of a non-negative integer n.",
+          "expected": "def factorial(n):\n    if n == 0:\n        return 1\n    return n * factorial(n - 1)",
+          "output": "Task: Write a Python function that computes the factorial of a non-negative integer n.\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "coding_002",
+          "difficulty": "medium",
+          "prompt": "Write a Python function that checks if a string is a palindrome (ignoring case and non-alphanumeric ",
+          "expected": "import re\ndef is_palindrome(s):\n    s = re.sub(r'[^a-zA-Z0-9]', '', s).lower()\n    return s == s[::-",
+          "output": "Task: Write a Python function that checks if a string is a palindrome (ignoring case and non-alphanumeric characters).\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "coding_003",
+          "difficulty": "hard",
+          "prompt": "Write a Python function that finds the longest common subsequence of two strings using dynamic progr",
+          "expected": "def lcs(s1, s2):\n    m, n = len(s1), len(s2)\n    dp = [[0]*(n+1) for _ in range(m+1)]\n    for i in r",
+          "output": "Task: Write a Python function that finds the longest common subsequence of two strings using dynamic programming.\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        }
+      ]
+    },
+    "math": {
+      "total": 5,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "items": [
+        {
+          "id": "math_001",
+          "difficulty": "easy",
+          "prompt": "What is 15 + 27?",
+          "expected": "42",
+          "output": "Task: What is 15 + 27?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "math_002",
+          "difficulty": "medium",
+          "prompt": "Solve for x: 2x + 5 = 17",
+          "expected": "6",
+          "output": "Task: Solve for x: 2x + 5 = 17\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "math_003",
+          "difficulty": "medium",
+          "prompt": "What is the area of a circle with radius 3? (Use pi = 3.14159)",
+          "expected": "28.27431",
+          "output": "Task: What is the area of a circle with radius 3? (Use pi = 3.14159)\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "math_004",
+          "difficulty": "hard",
+          "prompt": "Find the derivative of f(x) = 3x^2 + 2x + 1",
+          "expected": "6x + 2",
+          "output": "Task: Find the derivative of f(x) = 3x^2 + 2x + 1\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "math_005",
+          "difficulty": "hard",
+          "prompt": "A train travels 300 km in 4 hours. What is its average speed in km/h?",
+          "expected": "75",
+          "output": "Task: A train travels 300 km in 4 hours. What is its average speed in km/h?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        }
+      ]
+    },
+    "reasoning": {
+      "total": 4,
+      "passed": 1,
+      "pass_rate": 0.25,
+      "items": [
+        {
+          "id": "reasoning_001",
+          "difficulty": "easy",
+          "prompt": "All mammals are warm-blooded. All whales are mammals. Are whales warm-blooded?",
+          "expected": "yes",
+          "output": "Task: All mammals are warm-blooded. All whales are mammals. Are whales warm-blooded?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "reasoning_002",
+          "difficulty": "medium",
+          "prompt": "If it rains, the ground gets wet. The ground is wet. Did it rain?",
+          "expected": "cannot_be_determined",
+          "output": "Task: If it rains, the ground gets wet. The ground is wet. Did it rain?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "reasoning_003",
+          "difficulty": "hard",
+          "prompt": "Three boxes are labeled 'Apples', 'Oranges', and 'Mixed'. All labels are wrong. You can pick one fru",
+          "expected": "mixed",
+          "output": "Task: Three boxes are labeled 'Apples', 'Oranges', and 'Mixed'. All labels are wrong. You can pick one fruit from one box. Which box do you pick from to correctly relabel all boxes?\nAnswer::::::::::::",
+          "passed": true
+        },
+        {
+          "id": "reasoning_004",
+          "difficulty": "medium",
+          "prompt": "John is taller than Mary. Mary is taller than Sue. Is John taller than Sue?",
+          "expected": "yes",
+          "output": "Task: John is taller than Mary. Mary is taller than Sue. Is John taller than Sue?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        }
+      ]
+    },
+    "factual": {
+      "total": 4,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "items": [
+        {
+          "id": "factual_001",
+          "difficulty": "easy",
+          "prompt": "What is the capital of France?",
+          "expected": "Paris",
+          "output": "Task: What is the capital of France?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "factual_002",
+          "difficulty": "medium",
+          "prompt": "What element has the chemical symbol 'Au'?",
+          "expected": "gold",
+          "output": "Task: What element has the chemical symbol 'Au'?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "factual_003",
+          "difficulty": "hard",
+          "prompt": "Who developed the theory of general relativity?",
+          "expected": "Albert Einstein",
+          "output": "Task: Who developed the theory of general relativity?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        },
+        {
+          "id": "factual_004",
+          "difficulty": "medium",
+          "prompt": "What is the largest planet in our solar system?",
+          "expected": "Jupiter",
+          "output": "Task: What is the largest planet in our solar system?\nAnswer:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::",
+          "passed": false
+        }
+      ]
+    },
+    "research": {
+      "total": 2,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "items": [
+        {
+          "id": "research_001",
+          "difficulty": "hard",
+          "prompt": "A pharmaceutical company claims a new drug reduces blood pressure by 15 mmHg on average. In a trial ",
+          "expected": "no",
+          "output": "Task: A pharmaceutical company claims a new drug reduces blood pressure by 15 mmHg on average. In a trial of 100 patients, the mean reduction was 12 mmHg with standard deviation 5 mmHg. Is the company",
+          "passed": false
+        },
+        {
+          "id": "research_002",
+          "difficulty": "hard",
+          "prompt": "Design an experiment to test whether a new teaching method improves student test scores. Identify th",
+          "expected": "experimental_design",
+          "output": "Task: Design an experiment to test whether a new teaching method improves student test scores. Identify the independent variable, dependent variable, control group, and potential confounds.\nAnswer::::",
+          "passed": false
+        }
+      ]
+    }
+  }
+}

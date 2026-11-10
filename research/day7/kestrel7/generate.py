@@ -30,6 +30,7 @@ produced it.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -46,6 +47,33 @@ PYTHON = "python"
 JSON = "json"
 THINK = "think"
 VALID_MODES = {PLAIN, PYTHON, JSON, THINK}
+
+
+@dataclass
+class GenerationResult:
+    """Structured output of a generation run (P0.3).
+
+    ``continuation`` is the canonical generated text; ``prompt`` is kept
+    separately so callers can never accidentally score the prompt as part of
+    the model's answer (P0.1 prompt-leakage fix).
+    """
+
+    prompt: str
+    continuation: str
+    full_text: str
+    finish_reason: str
+    tokens_generated: int
+    truncated: bool
+    provenance: List[str] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        """Backward-compatible accessor returning prompt + continuation."""
+        return self.full_text
+
+
+def _finish_reason_name(reason: str) -> str:
+    return reason
 
 
 def top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -148,7 +176,15 @@ def generate_v7(
         )
         if provenance is not None:
             provenance.extend(origins + ["context_limit_reached"])
-        return prompt + "\n[CONTEXT_LIMIT_REACHED] " + provenance_note
+        return GenerationResult(
+            prompt=prompt,
+            continuation="",
+            full_text=prompt + "\n[CONTEXT_LIMIT_REACHED] " + provenance_note,
+            finish_reason="context_limit_reached",
+            tokens_generated=0,
+            truncated=truncated,
+            provenance=origins if provenance is None else provenance,
+        )
 
     if truncation_info["truncated"]:
         origins.append("prompt_truncated")
@@ -161,6 +197,7 @@ def generate_v7(
         generator.manual_seed(seed)
 
     cur_text = prompt
+    finish_reason = "length"  # default if we exhaust max_new_tokens without EOS
     for step_idx in range(max_new_tokens):
         step_logits = logits[0] if logits.dim() == 2 else logits[0, -1]
         if vexx is not None:
@@ -181,6 +218,7 @@ def generate_v7(
 
         next_id = int(sample_next(step_logits.unsqueeze(0), temperature, top_p, generator).item())
         if eos_id is not None and next_id == eos_id:
+            finish_reason = "eos"
             break
         generated.append(next_id)
         cur_text = prompt + tokenizer.decode(generated)
@@ -218,9 +256,18 @@ def generate_v7(
         )
         seq_start += 1
 
-    result = prompt + tokenizer.decode(generated)
+    continuation = tokenizer.decode(generated, preserve_protocol=True)
     if truncation_info["truncated"]:
         origins.append("prompt_truncated")
+    full_text = prompt + continuation
     if provenance is not None:
         provenance.extend(origins)
-    return result
+    return GenerationResult(
+        prompt=prompt,
+        continuation=continuation,
+        full_text=full_text,
+        finish_reason=finish_reason,
+        tokens_generated=len(generated),
+        truncated=truncated,
+        provenance=origins if provenance is None else provenance,
+    )

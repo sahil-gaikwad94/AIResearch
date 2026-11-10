@@ -219,12 +219,49 @@ class BPETokenizer:
         return seq
 
     def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> List[int]:
+        """Encode text to token IDs.
+
+        P0.5: protocol markers (THINK_START/THINK_END) are encoded as their real
+        special-token IDs, not as raw UTF-8/BPE byte tokens. Other special
+        tokens (BOS/EOS/PAD/UNK) are only added via add_bos/add_eos. This lets
+        the generation controller observe protocol markers in generated IDs and
+        prevents accidental spoofing through ordinary text.
+        """
         ids: List[int] = []
         if add_bos:
             ids.append(self.token_to_id[BOS])
-        for pre in _PAT.findall(text):
-            byte_ids = [self.token_to_id[chr(b)] for b in pre.encode("utf-8")]
-            ids.extend(self._encode_bytes(byte_ids))
+
+        # Scan for protocol marker tokens as literal substrings first, so they
+        # are never split into byte-level BPE pieces.
+        i = 0
+        n = len(text)
+        while i < n:
+            matched = False
+            for marker in (THINK_START, THINK_END):
+                if text.startswith(marker, i):
+                    ids.append(self.token_to_id[marker])
+                    i += len(marker)
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            pre_segment = text[i]
+            # Consume plain text until the next protocol marker.
+            j = i + 1
+            next_marker = None
+            next_marker_pos = n
+            for marker in (THINK_START, THINK_END):
+                pos = text.find(marker, j)
+                if pos != -1 and pos < next_marker_pos:
+                    next_marker_pos = pos
+                    next_marker = marker
+            plain = text[i:next_marker_pos]
+            for pre in _PAT.findall(plain):
+                byte_ids = [self.token_to_id[chr(b)] for b in pre.encode("utf-8")]
+                ids.extend(self._encode_bytes(byte_ids))
+            i = next_marker_pos
+
         if add_eos:
             ids.append(self.token_to_id[EOS])
         return ids

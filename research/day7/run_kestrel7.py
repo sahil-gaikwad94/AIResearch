@@ -229,10 +229,10 @@ def main() -> int:
     ]
     print("[generate] VEXX-guided (greedy; temperature=None contract)")
     for prompt in prompts:
-        out = generate_v7(
+        result = generate_v7(
             fresh, tok, prompt, max_new_tokens=args.max_new, temperature=None, vexx=vexx
         )
-        print(f"  PROMPT: {prompt!r}\n  OUTPUT: {out!r}")
+        print(f"  PROMPT: {prompt!r}\n  OUTPUT: {result.continuation!r}")
 
     print(
         "[done] trained, validated, checkpoint verified, and VEXX-guided generation "

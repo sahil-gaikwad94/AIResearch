@@ -382,7 +382,9 @@ def test_tier1_lexer_ast_arity_and_receivers(vx):
 def test_tier2_crane_cas(vx):
     assert vx.crane_cas_evaluate("37 * 48 - 19 * 32") == "1168"
     assert vx.crane_cas_evaluate("(5/6 - 1/4) / (7/12)") == "1"
-    assert vx.solve_linear_system(["2*x + 3*y = 17", "x - y = 1"], ["x", "y"]) == ("4", "3")
+    ls = vx.solve_linear_system(["2*x + 3*y = 17", "x - y = 1"], ["x", "y"])
+    assert ls["status"] == "unique", ls
+    assert ls["solution"] == {"x": "4", "y": "3"}
     assert vx.integrate_definite("3*x^2 + 2*x", "x", 0, 2) == "12"
     assert vx.crane_cas_evaluate("1 / (x - 2)", {"x": 2}) == "DIV_BY_ZERO"
     assert vx.crane_cas_evaluate("2 ** 10") == "1024"
@@ -436,13 +438,19 @@ def test_tier4_epistemic_calibration(vx):
     for prompt, verdict in cases.items():
         result = vx.verify_epistemic_calibration(prompt)
         assert result is not None and result["verdict"] == verdict, prompt
-    # Do not over-flag a genuinely significant result.
-    assert vx.verify_epistemic_calibration("95% CI [0.4, 2.1], p=0.01.") is None
+    # CI excludes zero and p < 0.05: the result IS statistically significant;
+    # the statistical rule fires and returns "established". Fail-closed
+    # "unknown" applies only when no heuristic rule matches at all.
+    result = vx.verify_epistemic_calibration("95% CI [0.4, 2.1], p=0.01.")
+    assert result is not None and result["verdict"] == "established", result
     # A high p-value can be non-significant without the CI crossing zero; the
     # explanation must state only reasons that are actually true.
     weak = vx.verify_epistemic_calibration("95% CI [0.4, 2.1], p=0.8.")
     assert weak is not None and weak["verdict"] == "not established"
     assert "includes zero" not in weak["explanation"]
+
+    # Unmatched heuristics fail closed: unknown, not established.
+    assert vx.verify_epistemic_calibration("Some random claim about nothing.")["verdict"] == "unknown"
 
 
 # --------------------------------------------------------------------------- [16]
@@ -571,10 +579,10 @@ def test_greedy_contract_and_determinism(hybrid, tok):
     hybrid.eval()
     out1 = generate_v7(hybrid, tok, "hello", max_new_tokens=6, temperature=None)
     out2 = generate_v7(hybrid, tok, "hello", max_new_tokens=6, temperature=None)
-    assert out1 == out2 and out1.startswith("hello")
+    assert out1.continuation == out2.continuation and out1.full_text.startswith("hello")
     # Temperature sampling still returns text.
     sampled = generate_v7(hybrid, tok, "hello", max_new_tokens=4, temperature=0.8, top_p=0.9, seed=0)
-    assert isinstance(sampled, str) and sampled.startswith("hello")
+    assert isinstance(sampled.continuation, str) and sampled.full_text.startswith("hello")
 
 
 # --------------------------------------------------------------------------- [21] initialization
@@ -736,7 +744,7 @@ def test_cas_splice_feeds_the_equals_token_into_the_cache(tok):
     model = _RecordingModel(tok.vocab_size, max_ctx=64, forced_id=eq_id)
     prompt = THINK_START + "<<1+1"  # the model itself emits the trailing '='
     out = generate_v7(model, tok, prompt, max_new_tokens=8, temperature=None, vexx=Vexx3Controller())
-    assert out.startswith(prompt)
+    assert out.full_text.startswith(prompt)
     expected = [eq_id] + tok.encode("2>>", add_bos=False, add_eos=False)
     assert model.calls[: len(expected)] == expected, (
         "the '=' token was skipped before the spliced CAS value"
@@ -745,7 +753,7 @@ def test_cas_splice_feeds_the_equals_token_into_the_cache(tok):
 
 def test_generate_uses_truncated_prompt_length_as_position(tok):
     model = _RecordingModel(tok.vocab_size, max_ctx=8, forced_id=0)
-    generate_v7(model, tok, "hello world " * 40, max_new_tokens=1, temperature=None)
+    generate_v7(model, tok, "hello world " * 40, max_new_tokens=1, temperature=None).continuation
     assert model.prefill_len == 8, "prefill was not truncated to max_ctx"
     assert model.seq_starts and model.seq_starts[0] == 8, (
         "seq_start used the untruncated prompt length"
@@ -1092,7 +1100,7 @@ def test_generate_always_invokes_model_prefill(tok):
     prompt = "A trial reports 95% CI [-0.5, 2.9], p=0.17. Does it establish efficacy?"
     out = generate_v7(model, tok, prompt, max_new_tokens=4, temperature=None, vexx=vexx)
     assert model.prefill_calls >= 1, "prefill must be invoked even for calibration-style prompts"
-    assert out.startswith(prompt), "output must start with the prompt"
+    assert out.full_text.startswith(prompt), "output must start with the prompt"
 
     # A calibration flag does not replace neural output.
     out2 = generate_v7(model, tok, prompt, max_new_tokens=4, temperature=None, vexx=vexx)

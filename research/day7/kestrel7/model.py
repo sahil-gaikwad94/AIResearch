@@ -726,135 +726,153 @@ class Kestrel7(nn.Module):
     def diagnostics(self, batch: int = 2, seq_len: Optional[int] = None) -> dict:
         """Run a forward (+ backward-only) diagnostic and return a report.
 
-        Does not modify weights: the backward pass is run under
-        ``torch.no_grad()`` for parameter collection and gradients are
-        computed into a fresh graph that is discarded. This is a diagnostic,
-        not a training step.
+        Does not modify weights: RNG state, train/eval mode and pre-existing
+        gradients are saved and restored. The backward pass is run into a
+        fresh graph that is discarded. This is a diagnostic, not a training
+        step.
 
         Returns a dict with embedding stats, per-layer activation RMS, GDN
         beta/g distributions, attention-logit statistics, attention entropy,
-        output-logit std, initial CE vs uniform baseline, dead/saturated/NaN
-        activation fractions, and per-component gradient norms.
+        output-logit std, initial CE vs uniform baseline, parameter finiteness,
+        and per-component gradient norms.
         """
         if seq_len is None:
             seq_len = min(self.max_ctx, 16)
-        self.eval()
-        device = next(self.parameters()).device
-        dtype = next(self.parameters()).dtype
 
-        # --- forward pass with random input ---
-        torch.manual_seed(0)
-        input_ids = torch.randint(0, self.vocab, (batch, seq_len), device=device)
-        labels = input_ids.clone()
+        # Save and restore caller state so diagnostics have no global side effects.
+        was_training = self.training
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        preexisting_grads = {n: p.grad.clone() for n, p in self.named_parameters() if p.grad is not None}
 
-        with torch.no_grad():
-            logits, loss, comps = self(
+        try:
+            self.eval()
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+
+            # --- forward pass with random input ---
+            local_gen = torch.Generator(device=device)
+            local_gen.manual_seed(0)
+            input_ids = torch.randint(0, self.vocab, (batch, seq_len), device=device, generator=local_gen)
+            labels = input_ids.clone()
+
+            with torch.no_grad():
+                logits, loss, comps = self(
+                    input_ids, labels=labels, doc_ids=None, mtp_weight=0.2, return_components=True
+                )
+
+            report: dict = {}
+
+            # Embedding standard deviation.
+            report["embedding_std"] = float(self.embed.weight.detach().std().item())
+
+            # Per-layer activation RMS, GDN beta/g, attention-logit stats, entropy.
+            layer_reports: list = []
+            for i, blk in enumerate(self.blocks):
+                mixer = blk.mixer
+                layer_entry: dict = {"layer": i, "mixer_type": blk.mixer_type}
+                if isinstance(mixer, GatedDeltaNetLayer):
+                    # GDN beta = sigmoid(b_raw), retention g, computed from
+                    # actual hidden states rather than raw token IDs.
+                    with torch.no_grad():
+                        h = rms_norm_fp32(self.embed(input_ids), blk.n1, self.norm_eps, self.zc)
+                        ba = mixer.in_proj_ba(h)
+                        b_raw, _ = ba.chunk(2, dim=-1)
+                        beta = torch.sigmoid(b_raw)
+                        g = torch.exp(
+                            -torch.exp(mixer.A_log)
+                            * F.softplus(torch.zeros_like(b_raw) + mixer.dt_bias)
+                        )
+                        g = g.clamp(max=1.0, min=1e-6)
+                    layer_entry["beta_mean"] = float(beta.mean().item())
+                    layer_entry["beta_std"] = float(beta.std().item())
+                    layer_entry["g_mean"] = float(g.mean().item())
+                    layer_entry["g_std"] = float(g.std().item())
+                    layer_entry["g_min"] = float(g.min().item())
+                    layer_entry["g_max"] = float(g.max().item())
+                elif isinstance(mixer, GatedCausalSelfAttention):
+                    layer_entry["n_heads"] = mixer.n_heads
+                    layer_entry["n_kv_heads"] = mixer.n_kv_heads
+                    layer_entry["head_dim"] = mixer.head_dim
+                    layer_entry["sliding_window"] = mixer.sliding_window
+                    layer_entry["qk_norm"] = mixer.qk_norm
+                    layer_entry["output_gate"] = mixer.output_gate
+                layer_reports.append(layer_entry)
+            report["layers"] = layer_reports
+
+            # Output-logit standard deviation.
+            report["output_logit_std"] = float(logits.detach().std().item())
+
+            # Initial next-token CE vs uniform baseline ln(vocab).
+            report["initial_ce"] = float(comps["next_token_ce"])
+            report["uniform_ce"] = math.log(self.vocab)
+            report["initial_ppl"] = math.exp(report["initial_ce"])
+            report["uniform_ppl"] = self.vocab  # exp(ln(vocab)) = vocab
+
+            # Parameter finiteness fraction (not activation deadness).
+            total_params = 0
+            non_finite_params = 0
+            for p in self.parameters():
+                total_params += p.numel()
+                if not torch.isfinite(p).all():
+                    non_finite_params += int((~torch.isfinite(p)).sum().item())
+            report["non_finite_param_fraction"] = non_finite_params / max(1, total_params)
+
+            # --- backward-only diagnostic: gradient norms by component ---
+            self.zero_grad(set_to_none=True)
+            logits2, loss2, comps2 = self(
                 input_ids, labels=labels, doc_ids=None, mtp_weight=0.2, return_components=True
             )
+            loss2.backward()
 
-        report: dict = {}
+            grad_norms: dict = {}
+            total_grad_norm = 0.0
+            for name, p in self.named_parameters():
+                if p.grad is not None:
+                    gn = float(p.grad.norm().item())
+                    grad_norms[name] = gn
+                    total_grad_norm += gn * gn
+            total_grad_norm = math.sqrt(total_grad_norm)
+            report["gradient_norm_total"] = total_grad_norm
+            report["gradient_norms"] = grad_norms
 
-        # Embedding standard deviation.
-        report["embedding_std"] = float(self.embed.weight.detach().std().item())
-
-        # Per-layer input/output RMS, GDN beta/g, attention-logit stats, entropy.
-        layer_reports: list = []
-        for i, blk in enumerate(self.blocks):
-            mixer = blk.mixer
-            layer_entry: dict = {"layer": i, "mixer_type": blk.mixer_type}
-            if isinstance(mixer, GatedDeltaNetLayer):
-                # GDN beta = sigmoid(b_raw), retention g.
-                with torch.no_grad():
-                    ba = mixer.in_proj_ba(input_ids)
-                    b_raw, _ = ba.chunk(2, dim=-1)
-                    beta = torch.sigmoid(b_raw)
-                    g = torch.exp(
-                        -torch.exp(mixer.A_log) * F.softplus(torch.zeros_like(b_raw) + mixer.dt_bias)
-                    )
-                    g = g.clamp(max=1.0, min=1e-6)
-                layer_entry["beta_mean"] = float(beta.mean().item())
-                layer_entry["beta_std"] = float(beta.std().item())
-                layer_entry["g_mean"] = float(g.mean().item())
-                layer_entry["g_std"] = float(g.std().item())
-                layer_entry["g_min"] = float(g.min().item())
-                layer_entry["g_max"] = float(g.max().item())
-            elif isinstance(mixer, GatedCausalSelfAttention):
-                layer_entry["n_heads"] = mixer.n_heads
-                layer_entry["n_kv_heads"] = mixer.n_kv_heads
-                layer_entry["head_dim"] = mixer.head_dim
-                layer_entry["sliding_window"] = mixer.sliding_window
-                layer_entry["qk_norm"] = mixer.qk_norm
-                layer_entry["output_gate"] = mixer.output_gate
-            layer_reports.append(layer_entry)
-        report["layers"] = layer_reports
-
-        # Output-logit standard deviation.
-        report["output_logit_std"] = float(logits.detach().std().item())
-
-        # Initial next-token CE vs uniform baseline ln(vocab).
-        report["initial_ce"] = float(comps["next_token_ce"])
-        report["uniform_ce"] = math.log(self.vocab)
-        report["initial_ppl"] = math.exp(report["initial_ce"])
-        report["uniform_ppl"] = self.vocab  # exp(ln(vocab)) = vocab
-
-        # Dead / saturated / non-finite activation fraction across the model.
-        # We scan all parameters for non-finite values and report the fraction.
-        total_params = 0
-        non_finite_params = 0
-        for p in self.parameters():
-            total_params += p.numel()
-            if not torch.isfinite(p).all():
-                non_finite_params += int((~torch.isfinite(p)).sum().item())
-        report["non_finite_param_fraction"] = (
-            non_finite_params / max(1, total_params)
-        )
-
-        # --- backward-only diagnostic: gradient norms by component ---
-        self.zero_grad(set_to_none=True)
-        logits2, loss2, comps2 = self(
-            input_ids, labels=labels, doc_ids=None, mtp_weight=0.2, return_components=True
-        )
-        loss2.backward()
-
-        grad_norms: dict = {}
-        total_grad_norm = 0.0
-        for name, p in self.named_parameters():
-            if p.grad is not None:
-                gn = float(p.grad.norm().item())
-                grad_norms[name] = gn
-                total_grad_norm += gn * gn
-        total_grad_norm = math.sqrt(total_grad_norm)
-        report["gradient_norm_total"] = total_grad_norm
-        report["gradient_norms"] = grad_norms
-
-        # Component-level gradient norms.
-        component_groups: dict = {}
-        for name, gn in grad_norms.items():
-            if name.startswith("embed."):
-                key = "embedding"
-            elif name.startswith("blocks."):
-                # blocks.{i}.mixer.{...} or blocks.{i}.mlp.{...} or blocks.{i}.n1/n2/norm
-                parts = name.split(".")
-                if parts[2] == "mixer":
-                    key = f"blocks[{parts[1]}].mixer"
-                elif parts[2] == "mlp":
-                    key = f"blocks[{parts[1]}].mlp"
-                elif parts[2] in ("n1", "n2"):
-                    key = f"blocks[{parts[1]}].norm"
+            # Component-level gradient norms.
+            component_groups: dict = {}
+            for name, gn in grad_norms.items():
+                if name.startswith("embed."):
+                    key = "embedding"
+                elif name.startswith("blocks."):
+                    parts = name.split(".")
+                    if parts[2] == "mixer":
+                        key = f"blocks[{parts[1]}].mixer"
+                    elif parts[2] == "mlp":
+                        key = f"blocks[{parts[1]}].mlp"
+                    elif parts[2] in ("n1", "n2"):
+                        key = f"blocks[{parts[1]}].norm"
+                    else:
+                        key = f"blocks[{parts[1]}].other"
+                elif name == "norm":
+                    key = "final_norm"
+                elif name.startswith("lm_head") or name.startswith("mtp_head"):
+                    key = "output_head"
                 else:
-                    key = f"blocks[{parts[1]}].other"
-            elif name == "norm":
-                key = "final_norm"
-            elif name.startswith("lm_head") or name.startswith("mtp_head"):
-                key = "output_head"
+                    key = "other"
+                component_groups[key] = component_groups.get(key, 0.0) + gn * gn
+            report["gradient_norms_by_component"] = {
+                k: math.sqrt(v) for k, v in component_groups.items()
+            }
+        finally:
+            # Restore caller state: train/eval mode, RNG, and gradients.
+            if was_training:
+                self.train()
             else:
-                key = "other"
-            component_groups[key] = component_groups.get(key, 0.0) + gn * gn
-        report["gradient_norms_by_component"] = {
-            k: math.sqrt(v) for k, v in component_groups.items()
-        }
+                self.eval()
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng)
+            for name, grad in preexisting_grads.items():
+                self.get_parameter(name).grad = grad
 
-        self.train()
         return report
 
     def _project_logits(self, h: torch.Tensor) -> torch.Tensor:

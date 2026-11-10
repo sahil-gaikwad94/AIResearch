@@ -560,7 +560,9 @@ def solve_task(task: dict, vx: Vexx3Controller) -> Tuple[str, int]:
         return vx.crane_cas_evaluate(spec["expr"], spec.get("env")), points
     if solver == "linear_system":
         sol = vx.solve_linear_system(spec["eqs"], spec["vars"])
-        return ("" if sol is None else ",".join(sol)), points
+        if sol["status"] != "unique" or sol["solution"] is None:
+            return ("", 0)
+        return (",".join(sol["solution"][v] for v in spec["vars"])), points
     if solver == "modular":
         return vx.modular_pow(spec["a"], spec["b"], spec["m"]), points
     if solver == "integral":
@@ -595,7 +597,8 @@ def solve_task(task: dict, vx: Vexx3Controller) -> Tuple[str, int]:
         return science_answer(spec), points
     if solver == "calibration":
         result = vx.verify_epistemic_calibration(task["prompt"])
-        return (result["verdict"] if result else "established"), points
+        # result is always a dict now; "unknown" means no rule matched.
+        return (result["verdict"], points)
     raise ValueError(f"Unknown solver '{solver}'")
 
 

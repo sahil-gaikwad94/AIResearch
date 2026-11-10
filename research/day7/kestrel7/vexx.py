@@ -563,8 +563,18 @@ class Vexx3Controller:
             return f"ERROR: {e}"
 
     @staticmethod
-    def solve_linear_system(eqs: List[str], vars_list: List[str]) -> Optional[Tuple[str, ...]]:
-        """Solve equations exactly; returns the first solution tuple or None."""
+    def solve_linear_system(eqs: List[str], vars_list: List[str]) -> Dict[str, Any]:
+        """Solve a linear system and return a typed status dictionary.
+
+        Returns one of:
+          {"status": "unique", "solution": {var: str}, ...}
+          {"status": "underdetermined", "free_variables": [...], "solution": {...}, ...}
+          {"status": "inconsistent", "solution": None, ...}
+
+        Never raises ``KeyError`` for underdetermined or inconsistent systems.
+        P1.3: replaces the old partial-dict indexing that threw on systems
+        where sympy returned fewer variables than requested.
+        """
         syms = [sp.Symbol(v) for v in vars_list]
         if not (0 < len(eqs) <= 8) or not (0 < len(syms) <= 8):
             raise ValueError("solve_linear_system supports 1-8 equations and variables")
@@ -575,11 +585,92 @@ class Vexx3Controller:
                 raise ValueError(f"Equation '{eq}' has no '='")
             lhs, rhs = eq.replace("−", "-").split("=", 1)
             parsed_eqs.append(sp.Eq(safe_sympy(lhs, env), safe_sympy(rhs, env)))
-        sol = sp.solve(parsed_eqs, syms, dict=True)
-        if not sol:
-            return None
-        first = sol[0]
-        return tuple(str(sp.simplify(first[s])) for s in syms)
+
+        # Coefficient matrix and augmented matrix for rank analysis.
+        A_rows = []
+        aug_rows = []
+        for eq in parsed_eqs:
+            # Build row by extracting each symbol's coefficient.
+            row_coeffs = [sp.expand(eq.lhs - eq.rhs).coeff(s) for s in syms]
+            const = sp.expand(eq.lhs - eq.rhs).subs({s: 0 for s in syms})
+            A_rows.append(row_coeffs)
+            aug_rows.append(row_coeffs + [-const])
+
+        A = sp.Matrix(A_rows)
+        aug = sp.Matrix(aug_rows)
+        rank_A = A.rank()
+        rank_aug = aug.rank()
+
+        # Use linsolve for the full solution set (handles underdetermined).
+        sol_set = sp.linsolve(parsed_eqs, *syms)
+
+        if rank_A != rank_aug:
+            return {
+                "status": "inconsistent",
+                "variables": [str(s) for s in syms],
+                "solution": None,
+                "free_variables": [],
+                "rank_coeff": rank_A,
+                "rank_augmented": rank_aug,
+                "residual_check": {},
+            }
+
+        if rank_A < len(syms):
+            # Underdetermined: parameterize free variables.
+            params = list(sol_set.parameters) if hasattr(sol_set, "parameters") else []
+            free_vars = [str(p) for p in params]
+            # Extract a particular solution by setting free variables to 0.
+            particular = {}
+            for s in syms:
+                # Substitute free parameters with 0 to get one representative.
+                subs = {p: 0 for p in params}
+                try:
+                    val = sol_set.subs(subs)
+                    if isinstance(val, tuple):
+                        particular[str(s)] = str(sp.simplify(val[syms.index(s)]))
+                    else:
+                        particular[str(s)] = str(sp.simplify(val))
+                except Exception:
+                    particular[str(s)] = None
+            return {
+                "status": "underdetermined",
+                "variables": [str(s) for s in syms],
+                "solution": particular,
+                "free_variables": free_vars,
+                "rank_coeff": rank_A,
+                "rank_augmented": rank_aug,
+                "residual_check": {},
+            }
+
+        # Unique solution.
+        sol_dict = sp.solve(parsed_eqs, syms, dict=True)
+        if not sol_dict:
+            return {
+                "status": "inconsistent",
+                "variables": [str(s) for s in syms],
+                "solution": None,
+                "free_variables": [],
+                "rank_coeff": rank_A,
+                "rank_augmented": rank_aug,
+                "residual_check": {},
+            }
+        first = sol_dict[0]
+        solution = {}
+        residual_check = {}
+        for s in syms:
+            solution[str(s)] = str(sp.simplify(first[s]))
+        for eq in parsed_eqs:
+            resid = sp.simplify(eq.lhs.subs(first) - eq.rhs.subs(first))
+            residual_check[str(eq)] = str(resid)
+        return {
+            "status": "unique",
+            "variables": [str(s) for s in syms],
+            "solution": solution,
+            "free_variables": [],
+            "rank_coeff": rank_A,
+            "rank_augmented": rank_aug,
+            "residual_check": residual_check,
+        }
 
     @staticmethod
     def integrate_definite(expr_str: str, var_name: str, a: Any, b: Any) -> str:
@@ -727,6 +818,19 @@ class Vexx3Controller:
                         "FINAL: not established"
                     ),
                 }
+            # CI excludes zero and p < 0.05: the result IS statistically
+            # significant at the 5% level. Return established explicitly so
+            # solve_task can distinguish "matched but significant" from
+            # "no rule matched at all" (which must remain unknown).
+            return {
+                "type": "statistical_significance",
+                "verdict": "established",
+                "explanation": (
+                    f"The 95% interval [{ci_lo}, {ci_hi}] excludes zero and p={p_val} < 0.05, "
+                    "so the effect is statistically significant at the 5% level.\n"
+                    "FINAL: established"
+                ),
+            }
 
         # 2. Dated regulatory supersession: newer official notice wins.
         if "source a" in p_lower and "source b" in p_lower and "effective" in p_lower:
@@ -796,16 +900,37 @@ class Vexx3Controller:
 
         # 6. Mathematical false premise (0.999... < 1).
         if "0.999" in p_lower and "less than 1" in p_lower:
+            if "..." in p_lower:
+                # 0.999... with an infinite string of 9s equals 1.
+                return {
+                    "type": "false_premise",
+                    "verdict": "equal",
+                    "explanation": (
+                        "The premise is false: by geometric-series convergence "
+                        "(sum_{k>=1} 9/10^k = 1), 0.999... is strictly equal to 1.\nFINAL: equal"
+                    ),
+                }
+            # Finite decimal 0.999 is strictly less than 1.
             return {
-                "type": "false_premise",
-                "verdict": "equal",
+                "type": "numeric_literal",
+                "verdict": "less than 1",
                 "explanation": (
-                    "The premise is false: by geometric-series convergence "
-                    "(sum_{k>=1} 9/10^k = 1), 0.999999... is strictly equal to 1.\nFINAL: equal"
+                    "The finite decimal 0.999 (without infinite 9s) is strictly less than 1. "
+                    "This is distinct from 0.999... (repeating), which equals 1.\nFINAL: less than 1"
                 ),
             }
 
-        return None
+        # No heuristic rule matched: never imply the claim is established.
+        # P1.4: "no rule fired" means unknown / not assessed, not "established".
+        return {
+            "type": "heuristic_no_match",
+            "verdict": "unknown",
+            "explanation": (
+                "No epistemic heuristic rule matched this prompt. The claim is "
+                "not assessed, not established. Treat as unknown / insufficient "
+                "evidence.\nFINAL: unknown"
+            ),
+        }
 
     # ==================================================================
     # Tier 5: AST-sanitized execution sandbox + DPO collector

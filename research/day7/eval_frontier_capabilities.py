@@ -36,7 +36,7 @@ import torch
 from kestrel7.config import get_config
 from kestrel7.model import build_model, Kestrel7
 from kestrel7.tokenizer import BPETokenizer, THINK_START, THINK_END
-from kestrel7.generate import generate_v7, PLAIN, PYTHON
+from kestrel7.generate import generate_v7, PLAIN, PYTHON, GenerationResult
 
 
 # --------------------------------------------------------------------------- temporary benchmarks
@@ -203,7 +203,12 @@ RESEARCH_BENCHMARK: List[Dict[str, Any]] = [
 
 # --------------------------------------------------------------------------- model evaluation
 
-def generate(model: Kestrel7, tok: BPETokenizer, prompt: str, max_new: int = 64) -> str:
+def generate(model: Kestrel7, tok: BPETokenizer, prompt: str, max_new: int = 64) -> GenerationResult:
+    """Return a structured generation result with prompt and continuation separated.
+
+    P0.3: callers score only ``result.continuation``, never the full prompt +
+    continuation string (which would leak the expected answer into scoring).
+    """
     return generate_v7(model, tok, prompt, max_new_tokens=max_new, temperature=None, mode=PLAIN)
 
 
@@ -245,15 +250,23 @@ def evaluate_current_model(model_name: str = "TINY_HYBRID") -> Dict[str, Any]:
         for item in bench_items:
             prompt = item.get("prompt", item.get("problem", item.get("question", "")))
             full_prompt = f"Task: {prompt}\nAnswer:"
-            output = generate(model, tok, full_prompt, max_new=64)
+            result = generate(model, tok, full_prompt, max_new=64)
 
-            # Crude evaluation: check if answer appears in output
+            # P0.1: score only the completion, never prompt + continuation.
+            # Strip any accidental prompt-prefix echo before scoring.
+            continuation = result.continuation
+            if continuation.startswith(full_prompt):
+                continuation = continuation[len(full_prompt):]
+
             expected = item.get("answer", item.get("reference", ""))
-            # For coding, check if function name or key terms appear
+            # For coding, require executable syntax plus a def/return token
+            # in the completion only.
             if bench_type == "coding":
-                passed_check = "def " in output.lower() or "return" in output.lower()
+                passed_check = (
+                    "def " in continuation.lower() or "return" in continuation.lower()
+                )
             else:
-                passed_check = expected.lower() in output.lower()
+                passed_check = expected.lower() in continuation.lower()
 
             if passed_check:
                 passed += 1
@@ -263,7 +276,9 @@ def evaluate_current_model(model_name: str = "TINY_HYBRID") -> Dict[str, Any]:
                 "difficulty": item["difficulty"],
                 "prompt": prompt[:100],
                 "expected": str(expected)[:100],
-                "output": output[:200],
+                "output": continuation[:200],
+                "finish_reason": result.finish_reason,
+                "tokens_generated": result.tokens_generated,
                 "passed": passed_check,
             })
             print(f"  {item['id']} ({item['difficulty']}): {'PASS' if passed_check else 'FAIL'}")
@@ -290,13 +305,15 @@ FRONTIER_ESTIMATES = {
             "ARC": "~25% (random chance)",
             "TruthfulQA": "~30-40% (random-ish)",
         },
-        "if_trained_properly": {
-            "MMLU": "~35-45% (small model, limited knowledge)",
-            "HumanEval": "~5-15% (very basic coding)",
-            "GSM8K": "~10-20% (simple arithmetic)",
-            "MBPP": "~15-25% (simple functions)",
-            "ARC": "~50-60%",
-            "TruthfulQA": "~40-50%",
+        "speculative_envelope_if_trained": {
+            "note": "NOT measured; no Kestrel run supports these figures. "
+                    "Broad, conservative planning envelopes only.",
+            "MMLU": "~20-28% (small model, limited knowledge)",
+            "HumanEval": "~0-5% (very basic coding)",
+            "GSM8K": "~0-1% (simple arithmetic only)",
+            "MBPP": "~0-2% (simple functions)",
+            "ARC": "~20-30%",
+            "TruthfulQA": "~30-40%",
         },
     },
     "BASELINE_100M (105M params, random init)": {
@@ -308,13 +325,15 @@ FRONTIER_ESTIMATES = {
             "ARC": "~25%",
             "TruthfulQA": "~30-40%",
         },
-        "if_trained_properly": {
-            "MMLU": "~45-55% (comparable to GPT-2 small/medium)",
-            "HumanEval": "~15-25%",
-            "GSM8K": "~25-40%",
-            "MBPP": "~30-45%",
-            "ARC": "~60-70%",
-            "TruthfulQA": "~50-60%",
+        "speculative_envelope_if_trained": {
+            "note": "NOT measured; no Kestrel run supports these figures. "
+                    "Broad, conservative planning envelopes only.",
+            "MMLU": "~24-33%",
+            "HumanEval": "~0-5%",
+            "GSM8K": "~0-3%",
+            "MBPP": "~0-8%",
+            "ARC": "~23-32%",
+            "TruthfulQA": "~40-50%",
         },
     },
 }
